@@ -1,0 +1,7 @@
+---
+# pan.dev documents /oauth2/access_token; the pan-scm-sdk uses
+# /am/oauth2/access_token. Both are accepted today.
+scm_auth_url: https://auth.apps.paloaltonetworks.com/oauth2/access_token
+scm_api_url: https://api.strata.paloaltonetworks.com
+scm_validate_certs: true
+scm_http_timeout: 60

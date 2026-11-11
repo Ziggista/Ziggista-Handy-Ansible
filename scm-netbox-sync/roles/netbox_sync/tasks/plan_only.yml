@@ -1,0 +1,18 @@
+---
+- name: Build NetBox plan (applies the active/passive IP rule)
+  ansible.builtin.set_fact:
+    nb_plan: >-
+      {{ scm_devices | scm_netbox_plan(scm_op_interfaces | default({}),
+                                       scm_cfg_interfaces | default(None),
+                                       nb_existing | default([]),
+                                       netbox_plan_settings) }}
+
+- name: Show HA roles
+  ansible.builtin.debug:
+    msg: "{{ nb_plan.devices | map(attribute='name') | zip(nb_plan.devices | map(attribute='ha_role'),
+             nb_plan.devices | map(attribute='interface_source')) | map('join', ' / ') | list }}"
+
+- name: Show plan warnings
+  ansible.builtin.debug:
+    msg: "{{ nb_plan.warnings }}"
+  when: nb_plan.warnings | length > 0

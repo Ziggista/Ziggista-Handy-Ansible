@@ -1,0 +1,22 @@
+---
+netbox_plan_settings:
+  name_source: [hostname, display_name, name]
+  keep_existing_names: true
+  update_site: "{{ netbox_update_site }}"
+  default_site: "{{ netbox_default_site }}"
+  site_map: "{{ netbox_site_map }}"
+  site_name_rules: "{{ netbox_site_name_rules }}"
+  device_tags: "{{ netbox_device_tags }}"
+  interface_source: "{{ scm_interface_source }}"
+  fallback_to_config: "{{ scm_fallback_to_config }}"
+  ha_active_active_policy: "{{ scm_ha_active_active_policy }}"
+  mgmt_ip_policy: "{{ netbox_mgmt_ip_policy }}"
+  per_device_ip_interfaces_regex: "{{ netbox_per_device_ip_interfaces_regex }}"
+  mgmt_interface_name: "{{ netbox_mgmt_interface_name }}"
+  mgmt_networks: "{{ netbox_mgmt_networks }}"
+  mgmt_default_prefix_length: "{{ netbox_mgmt_default_prefix_length }}"
+  ignore_interfaces_regex: "{{ netbox_ignore_interfaces_regex }}"
+  default_physical_type: "{{ netbox_default_physical_type }}"
+  interface_type_rules: "{{ netbox_interface_type_rules }}"
+  zone_in_description: "{{ netbox_zone_in_description }}"
+  vrf: "{{ netbox_vrf }}"

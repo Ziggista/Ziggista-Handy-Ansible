@@ -1,0 +1,98 @@
+---
+# =========================================================================
+# Strata Cloud Manager -> NetBox sync: site settings
+# Secrets are NOT stored here. They come from environment variables
+# (AWX custom credential types inject them, see awx/) or from vault.yml.
+# =========================================================================
+
+# ---- Strata Cloud Manager ------------------------------------------------
+scm_client_id: "{{ lookup('ansible.builtin.env', 'SCM_CLIENT_ID') }}"
+scm_client_secret: "{{ lookup('ansible.builtin.env', 'SCM_CLIENT_SECRET') }}"
+scm_tsg_id: "{{ lookup('ansible.builtin.env', 'SCM_TSG_ID') }}"
+
+# ---- NetBox ----------------------------------------------------------------
+netbox_url: "{{ lookup('ansible.builtin.env', 'NETBOX_API') }}"
+netbox_token: "{{ lookup('ansible.builtin.env', 'NETBOX_TOKEN') }}"
+netbox_validate_certs: true
+
+# ---- Which SCM devices to import ------------------------------------------
+scm_model_regex: "^PA-"          # firewalls only (drops Panorama, Prisma Access etc.)
+scm_include_folders: []          # [] = all folders
+scm_exclude_names: []
+
+# Where interface data comes from:
+#   operational  live "show interface" via the NGFW Operations jobs API (actual
+#                names/IPs/speeds; needs the device to be connected). Falls back
+#                to config for devices whose job failed when scm_fallback_to_config.
+#   config       intent from the NGFW Configuration *-interfaces endpoints.
+#   auto         operational where available, config otherwise.
+scm_interface_source: operational
+scm_fallback_to_config: true
+
+# Write every raw SCM response to this directory on the controller (or the AWX
+# job's artifacts dir). Use on the first run to confirm the response shapes
+# flagged as unverified in the README. "" disables.
+scm_debug_dump_dir: ""
+
+# ---- NetBox objects ---------------------------------------------------------
+netbox_manufacturer: Palo Alto Networks
+netbox_device_role: Firewall
+netbox_platform: PAN-OS
+netbox_device_status: active
+netbox_create_device_types: true   # create a bare device type per model if missing
+netbox_vrf: null                   # VRF name for imported IPs (null = global)
+netbox_ip_status: active
+netbox_ip_description: "Synced from Strata Cloud Manager"
+
+# Site placement: SCM folder -> NetBox site slug, then name regex rules,
+# then the default. Devices already in NetBox keep their site unless
+# netbox_update_site is true.
+netbox_default_site: rockhampton-dc
+netbox_site_map: {}
+#   Datacentre: rockhampton-dc
+#   Branches: rrc-branch-generic
+netbox_site_name_rules: []
+#   - name_regex: "^frw-"
+#     site: fitzroy-river-water
+netbox_update_site: false
+
+# ---- The HA IP rule -----------------------------------------------------------
+# Dataplane IPs in an active/passive pair are shared, so only the ACTIVE member
+# gets them in NetBox. On failover the next run moves the same IP objects to the
+# new active (NetBox IP id, tags and history are kept).
+#
+# Management (and other per-box) IPs are unique per firewall. Policy:
+#   active_only  strict: passive gets no IPs at all (the rule as requested)
+#   both         passive keeps its own mgmt IP; dataplane IPs still active-only
+#   none         never import mgmt IPs
+netbox_mgmt_ip_policy: active_only
+netbox_per_device_ip_interfaces_regex: "^(mgmt|management)$"
+netbox_mgmt_interface_name: mgmt
+netbox_mgmt_networks: []           # e.g. ["10.10.0.0/24"]; gives the mask SCM omits
+netbox_mgmt_default_prefix_length: 32
+netbox_set_primary_ip: true        # set primary_ip4 + oob_ip to the mgmt IP
+
+# What to do with IPs left on a passive member in NetBox:
+#   unassign  detach from the interface, keep the IP object (default)
+#   delete    remove the IP object
+#   keep      report only
+netbox_passive_ip_action: unassign
+
+# Active/active pairs: "primary" treats active-primary as the IP owner;
+# "both" gives each member its own IPs (floating IPs will then flap).
+scm_ha_active_active_policy: primary
+
+# ---- Interfaces --------------------------------------------------------------
+netbox_ignore_interfaces_regex: "^(vlan|loopback|tunnel)$"   # bare parents with no unit
+netbox_default_physical_type: 1000base-t
+netbox_interface_type_rules:
+  - model_regex: "^PA-VM"
+    name_regex: "^ethernet"
+    type: virtual
+#  - model_regex: "^PA-34[0-9]0$"
+#    name_regex: "^ethernet1/(1[3-9]|20)$"
+#    type: 10gbase-x-sfpp
+netbox_zone_in_description: true
+
+netbox_device_tags:
+  - scm-managed

@@ -1,0 +1,122 @@
+---
+- name: Look up SCM serials already in NetBox
+  ansible.builtin.set_fact:
+    nb_existing: >-
+      {{ query('netbox.netbox.nb_lookup', 'devices',
+               api_filter=(scm_devices | map(attribute='serial_number') | map('regex_replace', '^', 'serial=') | join(' ')),
+               api_endpoint=netbox_url, token=netbox_token,
+               validate_certs=netbox_validate_certs)
+         | map(attribute='value') | list }}
+  when: scm_devices | length > 0
+
+- name: Build NetBox plan
+  ansible.builtin.include_tasks: plan_only.yml
+
+# ---------------------------------------------------------------- devices
+- name: Create or update firewalls (matched on serial)
+  netbox.netbox.netbox_device:
+    data:
+      name: "{{ item.name }}"
+      serial: "{{ item.serial }}"
+      device_type: "{{ item.model | lower | regex_replace('[^a-z0-9]+', '-') }}"
+      device_role: "{{ netbox_device_role }}"
+      platform: "{{ netbox_platform }}"
+      site: "{{ item.site }}"
+      status: "{{ netbox_device_status }}"
+      tags: "{{ item.tags }}"
+      custom_fields: "{{ item.custom_fields }}"
+    query_params: [serial]
+    state: present
+  loop: "{{ nb_plan.devices }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.ha_role }})"
+  register: nb_dev_out
+
+- name: Index NetBox device ids
+  ansible.builtin.set_fact:
+    nb_device_ids: >-
+      {{ dict(nb_dev_out.results | map(attribute='item.name')
+              | zip(nb_dev_out.results | map(attribute='device') | map(attribute='id', default=None))) }}
+
+# ---------------------------------------------------------------- interfaces
+- name: Create or update interfaces (all members, active and passive)
+  netbox.netbox.netbox_device_interface:
+    data:
+      device: "{{ item.device }}"
+      name: "{{ item.name }}"
+      type: "{{ item.type }}"
+      enabled: "{{ item.enabled }}"
+      mgmt_only: "{{ item.mgmt_only }}"
+      description: "{{ item.description if item.description else omit }}"
+      mtu: "{{ item.mtu if item.mtu else omit }}"
+      parent_interface: "{{ item.parent if item.parent else omit }}"
+      lag: "{{ item.lag if item.lag else omit }}"
+    state: present
+  loop: "{{ nb_plan.interfaces }}"
+  loop_control:
+    label: "{{ item.device }} {{ item.name }}"
+  # new devices do not exist yet in --check, so their interfaces cannot be checked
+  when: not ansible_check_mode or nb_device_ids[item.device] is not none
+
+# ---------------------------------------------------------------- IPs (active / standalone only)
+- name: Assign IPs to active and standalone firewalls (moves the IP on failover)
+  netbox.netbox.netbox_ip_address:
+    data:
+      address: "{{ item.address }}"
+      vrf: "{{ netbox_vrf if netbox_vrf else omit }}"
+      status: "{{ netbox_ip_status }}"
+      description: "{{ netbox_ip_description }}"
+      assigned_object:
+        device: "{{ item.device }}"
+        name: "{{ item.interface }}"
+      tags: "{{ netbox_device_tags }}"
+    # Match on address (+vrf) only, so an IP already on the old active is
+    # updated in place and re-pointed, instead of a duplicate being created.
+    query_params: "{{ ['address', 'vrf'] if netbox_vrf else ['address'] }}"
+    state: present
+  loop: "{{ nb_plan.ip_addresses }}"
+  loop_control:
+    label: "{{ item.device }} {{ item.interface }} {{ item.address }}"
+  when: not ansible_check_mode or nb_device_ids[item.device] is not none
+  register: nb_ip_out
+
+- name: Note which planned IPs exist in NetBox (new ones do not in --check)
+  ansible.builtin.set_fact:
+    nb_ip_ready: >-
+      {{ nb_ip_out.results | selectattr('ip_address', 'defined')
+         | selectattr('ip_address.id', 'defined') | map(attribute='item.address') | list }}
+
+- name: Release IPs left on passive members
+  ansible.builtin.include_tasks: passive.yml
+  when: nb_plan.passive_devices | length > 0
+
+- name: Set primary and OOB IP to the management address
+  netbox.netbox.netbox_device:
+    data:
+      name: "{{ item.name }}"
+      serial: "{{ item.serial }}"
+      primary_ip4: "{{ item.primary_ip4 }}"
+      oob_ip: "{{ item.primary_ip4 }}"
+    query_params: [serial]
+    state: present
+  loop: "{{ nb_plan.devices | selectattr('primary_ip4') | list }}"
+  loop_control:
+    label: "{{ item.name }} {{ item.primary_ip4 }}"
+  when:
+    - netbox_set_primary_ip | bool
+    - not ansible_check_mode or item.primary_ip4 in nb_ip_ready
+
+# ---------------------------------------------------------------- report
+- name: Publish run summary (AWX job artifacts)
+  ansible.builtin.set_stats:
+    data:
+      scm_netbox_sync:
+        devices: "{{ nb_plan.devices | length }}"
+        active: "{{ nb_plan.devices | selectattr('ha_role', 'eq', 'active') | map(attribute='name') | list }}"
+        passive: "{{ nb_plan.passive_devices }}"
+        held: "{{ nb_plan.held_devices }}"
+        interfaces: "{{ nb_plan.interfaces | length }}"
+        ip_addresses: "{{ nb_plan.ip_addresses | length }}"
+        released: "{{ nb_release | default([]) | map(attribute='address') | list }}"
+        warnings: "{{ nb_plan.warnings }}"
+    per_host: false

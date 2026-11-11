@@ -1,0 +1,61 @@
+---
+# POST /operations/v1/jobs/device-interfaces  {devices: [serial x1..5]} -> {job_id}
+# GET  /operations/v1/device/jobs/{job_id}    -> {state, results[{device, state, details.result}]}
+- name: Refresh SCM token
+  ansible.builtin.include_role:
+    name: scm_auth
+    public: true
+
+- name: Start device-interfaces jobs (5 serials per job)
+  ansible.builtin.uri:
+    url: "{{ scm_api_url }}/operations/v1/jobs/device-interfaces"
+    method: POST
+    headers: "{{ scm_headers }}"
+    body_format: json
+    body:
+      devices: "{{ item }}"
+    status_code: [200, 201, 202]
+    return_content: true
+    validate_certs: "{{ scm_validate_certs }}"
+    timeout: "{{ scm_http_timeout }}"
+  loop: "{{ scm_devices | selectattr('is_connected', 'defined') | selectattr('is_connected') |
+            map(attribute='serial_number') | batch(scm_ops_batch_size | int) | list }}"
+  loop_control:
+    label: "{{ item | join(',') }}"
+  register: scm_op_start
+  failed_when: false
+  check_mode: false   # read-only query on the firewall
+
+- name: Poll device-interfaces jobs
+  ansible.builtin.uri:
+    url: "{{ scm_api_url }}/operations/v1/device/jobs/{{ item.json.job_id }}"
+    headers: "{{ scm_headers }}"
+    return_content: true
+    validate_certs: "{{ scm_validate_certs }}"
+    timeout: "{{ scm_http_timeout }}"
+  loop: "{{ scm_op_start.results | selectattr('json', 'defined') | selectattr('json.job_id', 'defined') | list }}"
+  loop_control:
+    label: "{{ item.json.job_id }}"
+  register: scm_op_poll
+  until: scm_op_poll.json.state | default('') | lower in ['complete', 'completed', 'failed', 'error']
+  retries: "{{ scm_ops_poll_retries }}"
+  delay: "{{ scm_ops_poll_delay }}"
+  failed_when: false
+  check_mode: false
+
+- name: Parse live interface data
+  ansible.builtin.set_fact:
+    scm_op_jobs: "{{ scm_op_poll.results | default([]) | selectattr('json', 'defined') | map(attribute='json') | list }}"
+
+- name: Index live interfaces by serial
+  ansible.builtin.set_fact:
+    scm_op_interfaces: "{{ scm_op_jobs | scm_parse_op_interfaces }}"
+
+- name: Work out which devices have no live data
+  ansible.builtin.set_fact:
+    scm_op_missing: "{{ scm_devices | map(attribute='serial_number') | difference(scm_op_interfaces.keys() | list) }}"
+
+- name: Report devices without live interface data
+  ansible.builtin.debug:
+    msg: "No live interface data for {{ scm_op_missing | join(', ') }} (disconnected or job failed)"
+  when: scm_op_missing | length > 0

@@ -1,0 +1,46 @@
+---
+# GET /config/setup/v1/devices  (paged with limit/offset; body {data, total, limit, offset})
+- name: Get first page of SCM devices
+  ansible.builtin.uri:
+    url: "{{ scm_api_url }}/config/setup/v1/devices?limit={{ scm_page_size }}&offset=0"
+    headers: "{{ scm_headers }}"
+    return_content: true
+    validate_certs: "{{ scm_validate_certs }}"
+    timeout: "{{ scm_http_timeout }}"
+  register: scm_dev_first
+  check_mode: false
+
+- name: Get remaining pages of SCM devices
+  ansible.builtin.uri:
+    url: "{{ scm_api_url }}/config/setup/v1/devices?limit={{ scm_page_size }}&offset={{ item }}"
+    headers: "{{ scm_headers }}"
+    return_content: true
+    validate_certs: "{{ scm_validate_certs }}"
+    timeout: "{{ scm_http_timeout }}"
+  loop: "{{ range(scm_page_size | int, (scm_dev_first.json.total | default(0)) | int, scm_page_size | int) | list }}"
+  register: scm_dev_more
+  check_mode: false
+
+- name: Combine and filter devices
+  ansible.builtin.set_fact:
+    scm_devices_raw: "{{ scm_dev_first.json.data | default([]) +
+                         (scm_dev_more.results | default([]) | map(attribute='json') | map(attribute='data') | flatten) }}"
+
+- name: Select firewalls
+  ansible.builtin.set_fact:
+    scm_devices: "{{ scm_devices_raw | scm_select_devices(scm_model_regex, scm_include_folders, scm_exclude_names) }}"
+
+- name: Warn if the device list may be truncated
+  ansible.builtin.debug:
+    msg: >-
+      SCM returned {{ scm_dev_first.json.data | default([]) | length }} devices and no 'total';
+      the list may be truncated. Raise scm_page_size or check the pagination fields.
+  when:
+    - scm_dev_first.json.total is not defined
+    - (scm_dev_first.json.data | default([]) | length) >= (scm_page_size | int)
+
+- name: Report SCM devices
+  ansible.builtin.debug:
+    msg: >-
+      {{ scm_devices | length }} firewalls selected from {{ scm_devices_raw | length }} SCM devices:
+      {{ scm_devices | map(attribute='serial_number') | join(', ') }}

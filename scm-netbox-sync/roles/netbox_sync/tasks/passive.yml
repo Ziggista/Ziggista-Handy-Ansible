@@ -1,0 +1,77 @@
+---
+# After the active's IPs are in place, anything still attached to a passive
+# member is stale (pre-failover or removed config). Release it.
+- name: Find IPs still attached to passive members
+  ansible.builtin.set_fact:
+    nb_release: >-
+      {{ nb_release | default([]) +
+         (query('netbox.netbox.nb_lookup', 'ip-addresses',
+                api_filter='device_id=' ~ nb_device_ids[item],
+                api_endpoint=netbox_url, token=netbox_token,
+                validate_certs=netbox_validate_certs)
+          | scm_ips_to_release(nb_plan, item)) }}
+  loop: "{{ nb_plan.passive_devices }}"
+  when: nb_device_ids[item] is not none
+
+- name: Report IPs to release from passive members
+  ansible.builtin.debug:
+    msg: >-
+      {{ netbox_passive_ip_action }}:
+      {{ nb_release | default([]) | map(attribute='address')
+         | zip(nb_release | default([]) | map(attribute='device'))
+         | map('join', ' on ') | list }}
+  when: nb_release | default([]) | length > 0
+
+# NetBox refuses to move an IP that is a device's primary/OOB IP, so clear
+# those on the passive first (only matters with mgmt_ip_policy=active_only).
+- name: Clear primary/OOB IP on passive members that are losing IPs
+  ansible.builtin.uri:
+    url: "{{ netbox_url | regex_replace('/$', '') }}/api/dcim/devices/{{ nb_device_ids[item] }}/"
+    method: PATCH
+    headers:
+      Authorization: "{{ 'Bearer' if netbox_token is match('nbt_') else 'Token' }} {{ netbox_token }}"
+      Accept: application/json
+    body_format: json
+    body: {primary_ip4: null, primary_ip6: null, oob_ip: null}
+    validate_certs: "{{ netbox_validate_certs }}"
+  loop: "{{ nb_release | default([]) | map(attribute='device') | unique | list }}"
+  when:
+    - not ansible_check_mode
+    - netbox_passive_ip_action in ['unassign', 'delete']
+    - netbox_mgmt_ip_policy != 'both'
+  changed_when: true
+
+- name: Unassign stale IPs from passive members
+  ansible.builtin.uri:
+    url: "{{ netbox_url | regex_replace('/$', '') }}/api/ipam/ip-addresses/{{ item.id }}/"
+    method: PATCH
+    headers:
+      Authorization: "{{ 'Bearer' if netbox_token is match('nbt_') else 'Token' }} {{ netbox_token }}"
+      Accept: application/json
+    body_format: json
+    body: {assigned_object_type: null, assigned_object_id: null}
+    validate_certs: "{{ netbox_validate_certs }}"
+  loop: "{{ nb_release | default([]) }}"
+  loop_control:
+    label: "{{ item.device }} {{ item.address }}"
+  when:
+    - not ansible_check_mode
+    - netbox_passive_ip_action == 'unassign'
+  changed_when: true
+
+- name: Delete stale IPs from passive members
+  ansible.builtin.uri:
+    url: "{{ netbox_url | regex_replace('/$', '') }}/api/ipam/ip-addresses/{{ item.id }}/"
+    method: DELETE
+    headers:
+      Authorization: "{{ 'Bearer' if netbox_token is match('nbt_') else 'Token' }} {{ netbox_token }}"
+      Accept: application/json
+    status_code: [204, 404]
+    validate_certs: "{{ netbox_validate_certs }}"
+  loop: "{{ nb_release | default([]) }}"
+  loop_control:
+    label: "{{ item.device }} {{ item.address }}"
+  when:
+    - not ansible_check_mode
+    - netbox_passive_ip_action == 'delete'
+  changed_when: true

@@ -1,0 +1,40 @@
+---
+# OAuth2 client credentials against the Palo Alto Networks identity service.
+# Tokens live 15 minutes, so the collect role calls this again before each
+# phase rather than trying to track expiry.
+- name: Check SCM credentials are present
+  ansible.builtin.assert:
+    that:
+      - scm_client_id | length > 0
+      - scm_client_secret | length > 0
+      - scm_tsg_id | string | length > 0
+    fail_msg: >-
+      SCM_CLIENT_ID, SCM_CLIENT_SECRET and SCM_TSG_ID must be set (AWX
+      credential "Strata Cloud Manager" or vault vars).
+    quiet: true
+
+- name: Get SCM access token
+  ansible.builtin.uri:
+    url: "{{ scm_auth_url }}"
+    method: POST
+    url_username: "{{ scm_client_id }}"
+    url_password: "{{ scm_client_secret }}"
+    force_basic_auth: true
+    body_format: form-urlencoded
+    body:
+      grant_type: client_credentials
+      scope: "tsg_id:{{ scm_tsg_id }}"
+    return_content: true
+    status_code: 200
+    validate_certs: "{{ scm_validate_certs }}"
+    timeout: "{{ scm_http_timeout }}"
+  register: scm_token_resp
+  no_log: "{{ scm_no_log | default(true) }}"
+  check_mode: false   # read-only, must run in --check too
+
+- name: Set SCM request headers
+  ansible.builtin.set_fact:
+    scm_headers:
+      Authorization: "Bearer {{ scm_token_resp.json.access_token }}"
+      Accept: application/json
+  no_log: "{{ scm_no_log | default(true) }}"

@@ -1,0 +1,9 @@
+---
+# Only needed outside AWX. Copy to vault.yml and encrypt:
+#   ansible-vault encrypt group_vars/all/vault.yml
+# These override the env-var lookups in main.yml.
+scm_client_id: "svc-netbox-sync@1234567890.iam.panserviceaccount.com"
+scm_client_secret: "CHANGE_ME"
+scm_tsg_id: "1234567890"
+netbox_url: "https://netbox.example.internal"
+netbox_token: "CHANGE_ME"

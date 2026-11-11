@@ -1,0 +1,6 @@
+---
+profile: production
+skip_list:
+  - var-naming[no-role-prefix]   # shared facts between roles are intentional (scm_*, nb_*)
+warn_list:
+  - args[module]                 # netbox_url/netbox_token come from play module_defaults
