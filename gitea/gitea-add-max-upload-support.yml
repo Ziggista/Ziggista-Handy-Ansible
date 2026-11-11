@@ -1,0 +1,33 @@
+---
+- name: Configure Gitea upload limits
+  hosts: gitea
+  become: true
+
+  handlers:
+    - name: Restart Gitea
+      service:
+        name: gitea
+        state: restarted
+
+  tasks:
+
+    - name: Ensure attachment uploads are enabled
+      community.general.ini_file:
+        path: /etc/gitea/app.ini
+        section: attachment
+        option: ENABLED
+        value: "true"
+        mode: "0644"
+      notify: Restart Gitea
+
+    - name: Set attachment upload limit to 200 MB
+      community.general.ini_file:
+        path: /etc/gitea/app.ini
+        section: repository.upload
+        option: FILE_MAX_SIZE
+        value: "200"
+        mode: "0644"
+      notify: Restart Gitea
+
+    - name: Flush handlers
+      meta: flush_handlers

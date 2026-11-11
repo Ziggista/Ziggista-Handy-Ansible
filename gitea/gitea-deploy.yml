@@ -1,0 +1,339 @@
+---
+- name: Deploy Gitea (Native + PostgreSQL + NGINX)
+  hosts: gitea
+  become: true
+
+  vars:
+    gitea_version: "1.26.2"
+
+    gitea_domain: git.rrc.local
+    gitea_root_url: "https://git.rrc.local/"
+
+    gitea_http_port: 3000
+    gitea_ssh_port: 22
+    gitea_ssh_domain: git.rrc.local
+
+    gitea_user: git
+    gitea_home: /var/lib/gitea
+    gitea_config_dir: /etc/gitea
+    gitea_log_dir: /var/log/gitea
+
+    gitea_db_name: gitea
+    gitea_db_user: gitea
+    
+    # For Certs
+    tls_dir: /etc/nginx/ssl
+
+
+
+  tasks:
+
+  - name: Install required packages
+    apt:
+      name:
+        - git
+        - nginx
+        - postgresql
+        - postgresql-contrib
+        - wget
+      update_cache: yes
+    tags: packages
+
+  - name: Ensure gitea user exists
+    user:
+      name: "{{ gitea_user }}"
+      system: yes
+      shell: /bin/bash
+      create_home: yes
+      home: "{{ gitea_home }}"
+    tags: gitea
+
+  - name: Create directories
+    file:
+      path: "{{ item }}"
+      state: directory
+      owner: "{{ gitea_user }}"
+      group: "{{ gitea_user }}"
+      mode: "0755"
+    loop:
+      - "{{ gitea_home }}"
+      - "{{ gitea_home }}/data"
+      - "{{ gitea_home }}/repositories"
+      - "{{ gitea_log_dir }}"
+      - "{{ gitea_config_dir }}"
+    tags: gitea
+
+  # - name: Download Gitea binary
+  #   get_url:
+  #     url: "https://dl.gitea.io/gitea/{{ gitea_version }}/gitea-{{ gitea_version }}-linux-amd64"
+  #     dest: /usr/local/bin/gitea
+  #     mode: "0755"
+  #   tags: gitea
+
+  - name: Ensure PostgreSQL is running
+    service:
+      name: postgresql
+      state: started
+      enabled: true
+    tags: postgres
+
+  - name: Wait for PostgreSQL socket
+    wait_for:
+      path: /var/run/postgresql/.s.PGSQL.5432
+      state: present
+      timeout: 30
+
+  - name: Create Gitea DB user
+    shell: |
+      sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ gitea_db_user }}'" | grep -q 1 || \
+      sudo -u postgres psql -c "CREATE USER {{ gitea_db_user }} WITH PASSWORD '{{ gitea_db_password }}';"
+    args:
+      executable: /bin/bash
+    changed_when: false
+    tags: postgres
+
+  - name: Create Gitea database
+    shell: |
+      sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw {{ gitea_db_name }} || \
+      sudo -u postgres psql -c "CREATE DATABASE {{ gitea_db_name }} OWNER {{ gitea_db_user }};"
+    args:
+      executable: /bin/bash
+    changed_when: false
+    tags: postgres
+
+  - name: Create app.ini
+    copy:
+      dest: "{{ gitea_config_dir }}/app.ini"
+      owner: "{{ gitea_user }}"
+      group: "{{ gitea_user }}"
+      mode: "0644"
+      content: |
+        [paths]
+        APP_NAME = Gitea
+        APP_DATA_PATH = {{ gitea_home }}/data
+        
+        [lfs]
+        PATH = {{ gitea_home }}/data/lfs
+        
+        [repository]
+        ROOT = {{ gitea_home }}/repositories
+
+        [attachment]
+        ENABLED = true
+        MAX_SIZE = 200
+
+        [server]
+        APP_WORK_PATH    = {{ gitea_home }}
+        DOMAIN           = {{ gitea_domain }}
+        ROOT_URL         = {{ gitea_root_url }}
+        HTTP_ADDR        = 127.0.0.1
+        HTTP_PORT        = {{ gitea_http_port }}
+        SSH_DOMAIN       = {{ gitea_ssh_domain }}
+        SSH_PORT         = {{ gitea_ssh_port }}
+        START_SSH_SERVER = false
+        MAX_REQUEST_BODY_SIZE = 209715200
+
+
+        [database]
+        DB_TYPE  = postgres
+        HOST     = 127.0.0.1:5432
+        NAME     = {{ gitea_db_name }}
+        USER     = {{ gitea_db_user }}
+        PASSWD   = {{ gitea_db_password }}
+
+        [service]
+        DISABLE_REGISTRATION = true
+        REQUIRE_SIGNIN_VIEW  = true
+
+        [log]
+        ROOT_PATH = {{ gitea_log_dir }}
+    tags: gitea
+
+  - name: Create systemd service
+    copy:
+      dest: /etc/systemd/system/gitea.service
+      content: |
+        [Unit]
+        Description=Gitea
+        After=network.target postgresql.service
+
+        [Service]
+        User={{ gitea_user }}
+        Group={{ gitea_user }}
+        WorkingDirectory={{ gitea_home }}
+        Environment=GITEA_WORK_DIR={{ gitea_home }}
+        ExecStart=/usr/local/bin/gitea web --config {{ gitea_config_dir }}/app.ini
+        Restart=always
+        Environment=USER={{ gitea_user }} HOME={{ gitea_home }}
+
+        [Install]
+        WantedBy=multi-user.target
+    tags: gitea
+
+  - name: Reload systemd
+    command: systemctl daemon-reexec
+    tags: gitea
+
+  - name: Restart Gitea
+    ansible.builtin.service:
+      name: gitea
+      state: restarted
+    tags: gitea
+
+  - name: Enable and start Gitea
+    service:
+      name: gitea
+      state: started
+      enabled: true
+    tags: gitea
+
+
+# ============================================================
+# Gitea HTTPS certificate (self-signed)
+# ============================================================
+
+  - name: Set TLS directory
+    set_fact:
+      tls_dir: "/etc/nginx/ssl"
+
+  - name: Ensure TLS directory exists
+    file:
+      path: "{{ tls_dir }}"
+      state: directory
+      mode: "0755"
+
+  - name: Check if Gitea HTTPS private key exists
+    stat:
+      path: "{{ tls_dir }}/{{ gitea_domain }}.key"
+    register: gitea_key_stat
+
+  - name: Check if Gitea HTTPS certificate exists
+    stat:
+      path: "{{ tls_dir }}/{{ gitea_domain }}.crt"
+    register: gitea_crt_stat
+
+  - name: Generate Gitea HTTPS private key
+    command: >
+      openssl genrsa -out {{ tls_dir }}/{{ gitea_domain }}.key 2048
+    when: not gitea_key_stat.stat.exists
+
+# ============================================================
+# Recreate CSR with SAN + timestamp
+# ============================================================
+
+  - name: Generate CSR timestamp
+    set_fact:
+      csr_timestamp: "{{ lookup('pipe', 'date +%Y%m%d%H%M%S') }}"
+
+  - name: Set CSR filename
+    set_fact:
+      csr_path: "{{ tls_dir }}/{{ gitea_domain }}-{{ csr_timestamp }}.csr"
+
+  - name: Ensure OpenSSL config with SAN exists
+    copy:
+      dest: "{{ tls_dir }}/gitea_https.cnf"
+      mode: "0644"
+      content: |
+        [ req ]
+        default_bits       = 2048
+        prompt             = no
+        default_md         = sha256
+        distinguished_name = dn
+        req_extensions     = v3_req
+
+        [ dn ]
+        CN = {{ gitea_domain }}
+
+        [ v3_req ]
+        subjectAltName = @alt_names
+
+        [ alt_names ]
+        DNS.1 = {{ gitea_domain }}
+        DNS.2 = gitea
+        DNS.3 = git
+
+  - name: Generate new CSR with SAN and timestamp
+    command: >
+      openssl req -new
+      -key {{ tls_dir }}/{{ gitea_domain }}.key
+      -out {{ csr_path }}
+      -config {{ tls_dir }}/gitea_https.cnf
+
+  - name: Show generated CSR path
+    debug:
+      msg: "CSR generated at {{ csr_path }}"
+
+  - name: Configure nginx site
+    copy:
+      dest: /etc/nginx/sites-available/gitea
+      content: |
+        server {
+            listen 80;
+            server_name {{ gitea_domain }};
+            return 301 https://$host$request_uri;
+        }
+
+        server {
+            listen 443 ssl;
+            server_name {{ gitea_domain }};
+
+            ssl_certificate /etc/nginx/ssl/{{ gitea_domain }}.crt;
+            ssl_certificate_key /etc/nginx/ssl/{{ gitea_domain }}.key;
+
+            client_max_body_size 512M;
+
+            location / {
+                proxy_pass http://127.0.0.1:{{ gitea_http_port }};
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+        }
+    tags: nginx
+
+  - name: Enable nginx site
+    file:
+      src: /etc/nginx/sites-available/gitea
+      dest: /etc/nginx/sites-enabled/gitea
+      state: link
+      force: yes
+    tags: nginx
+
+  - name: Remove default nginx site
+    file:
+      path: /etc/nginx/sites-enabled/default
+      state: absent
+    tags: nginx
+
+  - name: Validate nginx config
+    command: nginx -t
+
+  - name: Restart nginx
+    service:
+      name: nginx
+      state: restarted
+    tags: nginx
+
+  - name: Show Gitea access details
+    ansible.builtin.debug:
+      msg:
+        - "========================================"
+        - "Gitea deployment complete"
+        - ""
+        - "Web UI:"
+        - "  {{ gitea_root_url }}"
+        - ""
+        - "SSH (Git access):"
+        - "  ssh://git@{{ gitea_domain }}:{{ gitea_ssh_port }}"
+        - ""
+        - "Local access (direct IP if DNS not ready):"
+        - "  http://{{ ansible_host | default(inventory_hostname) }}:{{ gitea_http_port }}"
+        - ""
+        - "Nginx reverse proxy:"
+        - "  https://{{ gitea_domain }}"
+        - ""
+        - "Note:"
+        - "  - Self-signed certificate in use (browser warning expected)"
+        - "  - Ensure DNS resolves {{ gitea_domain }} → {{ ansible_host | default(inventory_hostname) }}"
+        - "========================================"

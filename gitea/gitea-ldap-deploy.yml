@@ -1,0 +1,47 @@
+---
+- name: Configure Gitea LDAP via API
+  hosts: gitea
+  connection: local
+  gather_facts: false
+
+
+  vars_files:
+    - ../../inventories/dev/group_vars/vsphere/vault.yml
+
+  tasks:
+
+    - name: Create LDAP auth source in Gitea
+      uri:
+        url: "{{ gitea_api_url }}/api/v1/admin/auths"
+        method: POST
+        headers:
+          Authorization: "{{ gitea_api_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "AD-LDAPS"
+          type: 2
+          is_active: true
+          security_protocol: 2
+
+          host: "rrc.local"
+          port: 636
+
+          bind_dn: "{{ gitea_ldap_bind_dn }}"
+          bind_password: "{{ gitea_ldap_bind_password }}"
+
+          user_base: "DC=RRC,DC=LOCAL"
+          user_filter: "(&(objectClass=user)(sAMAccountName=%s))"
+
+          login_attribute: "sAMAccountName"
+          name_attribute: "givenName"
+          surname_attribute: "sn"
+          email_attribute: "mail"
+
+          group_dn: "{{ gitea_required_group_dn }}"
+          user_uid: "member"
+          verify_group_membership: true
+
+          skip_tls_verify: true
+        validate_certs: false
+        status_code: [201, 422]

@@ -1,0 +1,69 @@
+---
+- name: Deploy Gitea (SSL Certs)
+  hosts: gitea
+  become: true
+
+  vars:
+    gitea_version: "1.26.2"
+
+    gitea_domain: git.rrc.local
+    gitea_root_url: "https://git.rrc.local/"
+
+    gitea_http_port: 3000
+    gitea_ssh_port: 22
+    gitea_ssh_domain: git.rrc.local
+
+    gitea_user: git
+    gitea_home: /var/lib/gitea
+    gitea_config_dir: /etc/gitea
+    gitea_log_dir: /var/log/gitea
+
+    gitea_db_name: gitea
+    gitea_db_user: gitea
+    
+    # For Certs
+    tls_dir: /etc/nginx/ssl
+
+  tasks:
+
+
+# ============================================================
+# Deploy signed SSL certificate (git.rrc.local)
+# ============================================================
+
+  - name: Ensure TLS directory exists
+    file:
+      path: "{{ tls_dir }}"
+      state: directory
+      mode: "0755"
+
+  - name: Upload signed certificate
+    copy:
+      src: git.rrc.local.cer
+      dest: "{{ tls_dir }}/{{ gitea_domain }}.crt"
+      owner: root
+      group: root
+      mode: "0644"
+
+  - name: Check if private key exists locally
+    delegate_to: localhost
+    run_once: true
+    become: false
+    stat:
+      path: "{{ playbook_dir }}/files/git.rrc.local.key"
+    register: local_key_file
+
+  # OPTIONAL: If you have a matching private key locally
+  - name: Upload private key (only if present locally)
+    copy:
+      src: git.rrc.local.key
+      dest: "{{ tls_dir }}/{{ gitea_domain }}.key"
+      owner: root
+      group: root
+      mode: "0600"
+    when: local_key_file.stat.exists
+
+  - name: Restart nginx to apply new cert
+    service:
+      name: nginx
+      state: restarted

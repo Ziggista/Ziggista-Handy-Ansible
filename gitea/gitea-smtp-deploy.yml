@@ -1,0 +1,85 @@
+---
+- name: Configure Gitea SMTP Mailer
+  hosts: gitea
+  become: true
+
+  vars:
+    gitea_user: git
+    gitea_home: /var/lib/gitea
+    gitea_config_dir: /etc/gitea
+
+    # Non-secret config (safe to keep in plain vars)
+    gitea_smtp_port: 587
+
+  vars_files:
+    - group_vars/gitea/vault.yml   # <- contains credentials
+
+  tasks:
+
+  # --------------------------------------------------------
+  # Ensure config directory exists (safety)
+  # --------------------------------------------------------
+  - name: Ensure Gitea config directory exists
+    file:
+      path: "{{ gitea_config_dir }}"
+      state: directory
+      owner: "{{ gitea_user }}"
+      group: "{{ gitea_user }}"
+      mode: "0755"
+
+  # --------------------------------------------------------
+  # Configure SMTP block in app.ini
+  # --------------------------------------------------------
+  - name: Enable SMTP mailer in app.ini
+    blockinfile:
+      path: "{{ gitea_config_dir }}/app.ini"
+      create: yes
+      owner: "{{ gitea_user }}"
+      group: "{{ gitea_user }}"
+      mode: "0644"
+      marker: "# {mark} ANSIBLE MANAGED BLOCK - SMTP"
+      block: |
+        [mailer]
+        ENABLED = true
+        PROTOCOL = smtp+starttls
+        SMTP_ADDR = {{ gitea_smtp_host }}
+        SMTP_PORT = {{ gitea_smtp_port }}
+        USER = {{ gitea_smtp_user }}
+        PASSWD = {{ gitea_smtp_password }}
+        FROM = {{ gitea_smtp_from }}
+        SMTP_AUTH_TYPE = plain
+        STARTTLS = true
+        FORCE_TRUST_SERVER_CERT = false
+    notify: Restart Gitea
+
+  # --------------------------------------------------------
+  # Debug confirmation output
+  # --------------------------------------------------------
+  - name: Show SMTP configuration summary
+    debug:
+      msg:
+        - "========================================"
+        - "Gitea SMTP Enabled"
+        - ""
+        - "SMTP Server: {{ gitea_smtp_host }}"
+        - "Port: {{ gitea_smtp_port }}"
+        - "User: {{ gitea_smtp_user }}"
+        - "From: {{ gitea_smtp_from }}"
+        - ""
+        - "Test by:"
+        - " - Password reset email"
+        - " - User registration"
+        - "========================================"
+
+  # --------------------------------------------------------
+  # Apply changes immediately
+  # --------------------------------------------------------
+  - name: Flush handlers
+    meta: flush_handlers
+
+  handlers:
+
+  - name: Restart Gitea
+    service:
+      name: gitea
+      state: restarted

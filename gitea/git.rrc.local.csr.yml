@@ -1,0 +1,40 @@
+- name: Fetch latest Gitea CSR file
+  hosts: gitea
+  become: true
+
+  vars:
+    remote_tls_dir: /etc/nginx/ssl
+    local_output_dir: ./csr-output
+
+  tasks:
+
+    - name: Ensure local output directory exists
+      delegate_to: localhost
+      become: false
+      file:
+        path: "{{ local_output_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Find CSR files on remote host
+      find:
+        paths: "{{ remote_tls_dir }}"
+        patterns: "git.rrc.local-*.csr"
+      register: csr_files
+
+    - name: Select newest CSR file
+      set_fact:
+        latest_csr: "{{ (csr_files.files | sort(attribute='mtime', reverse=True))[0].path }}"
+      when: csr_files.matched > 0
+
+    - name: Fetch latest CSR file
+      fetch:
+        src: "{{ latest_csr }}"
+        dest: "{{ local_output_dir }}/"
+        flat: true
+      when: csr_files.matched > 0
+
+    - name: Show fetched CSR
+      debug:
+        msg: "Fetched CSR: {{ latest_csr }}"
+      when: csr_files.matched > 0
