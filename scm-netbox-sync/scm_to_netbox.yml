@@ -1,0 +1,42 @@
+---
+# Strata Cloud Manager -> NetBox
+#
+#   ansible-playbook scm_to_netbox.yml --check --diff     # dry run
+#   ansible-playbook scm_to_netbox.yml                    # apply
+#   ansible-playbook scm_to_netbox.yml --tags collect -e scm_debug_dump_dir=./dump
+#
+# Credentials come from env vars (AWX credential types in awx/):
+#   SCM_CLIENT_ID SCM_CLIENT_SECRET SCM_TSG_ID NETBOX_API NETBOX_TOKEN
+- name: Sync Strata Cloud Manager firewalls into NetBox
+  hosts: localhost
+  gather_facts: false
+  module_defaults:
+    group/netbox.netbox.netbox:
+      netbox_url: "{{ netbox_url }}"
+      netbox_token: "{{ netbox_token }}"
+      validate_certs: "{{ netbox_validate_certs }}"
+  tasks:
+    - name: Collect from Strata Cloud Manager
+      ansible.builtin.include_role:
+        name: scm_collect
+        apply:
+          tags: [collect, always]
+      tags: [collect, always]
+
+    - name: Stop if SCM returned no firewalls
+      ansible.builtin.meta: end_play
+      when: scm_devices | length == 0
+
+    - name: NetBox prerequisites (manufacturer, role, platform, tags, custom fields, device types)
+      ansible.builtin.include_role:
+        name: netbox_prereqs
+        apply:
+          tags: [netbox, prereqs]
+      tags: [netbox, prereqs]
+
+    - name: Sync devices, interfaces and IPs
+      ansible.builtin.include_role:
+        name: netbox_sync
+        apply:
+          tags: [netbox, sync]
+      tags: [netbox, sync]

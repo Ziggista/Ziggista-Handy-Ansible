@@ -1,0 +1,65 @@
+---
+# Objects the sync depends on. All idempotent; safe to run every time.
+- name: Manufacturer
+  netbox.netbox.netbox_manufacturer:
+    data:
+      name: "{{ netbox_manufacturer }}"
+    state: present
+
+- name: Device role
+  netbox.netbox.netbox_device_role:
+    data:
+      name: "{{ netbox_device_role }}"
+      color: "{{ netbox_role_color }}"
+      vm_role: false
+    state: present
+
+- name: Platform
+  netbox.netbox.netbox_platform:
+    data:
+      name: "{{ netbox_platform }}"
+      manufacturer: "{{ netbox_manufacturer }}"
+    state: present
+
+- name: Device tags
+  netbox.netbox.netbox_tag:
+    data:
+      name: "{{ item }}"
+    state: present
+  loop: "{{ netbox_device_tags }}"
+
+- name: HA tags
+  netbox.netbox.netbox_tag:
+    data:
+      name: "{{ item.name }}"
+      color: "{{ item.color }}"
+      description: "{{ item.description }}"
+    state: present
+  loop: "{{ netbox_ha_tags }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Custom fields on dcim.device
+  netbox.netbox.netbox_custom_field:
+    data:
+      name: "{{ item.name }}"
+      label: "{{ item.label }}"
+      type: "{{ item.type }}"
+      object_types:
+        - dcim.device
+      group_name: Strata Cloud Manager
+      required: false
+    state: present
+  loop: "{{ netbox_scm_custom_fields }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Device types for every SCM model
+  netbox.netbox.netbox_device_type:
+    data:
+      model: "{{ item }}"
+      slug: "{{ item | lower | regex_replace('[^a-z0-9]+', '-') }}"
+      manufacturer: "{{ netbox_manufacturer }}"
+    state: present
+  loop: "{{ scm_devices | map(attribute='model') | unique | list }}"
+  when: netbox_create_device_types | bool

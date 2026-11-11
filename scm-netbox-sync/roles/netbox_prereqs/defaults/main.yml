@@ -1,0 +1,13 @@
+---
+netbox_role_color: "f44336"
+netbox_ha_tags:
+  - {name: ha-active, color: "4caf50", description: "Active member of an HA pair (owns the shared IPs)"}
+  - {name: ha-passive, color: "9e9e9e", description: "Passive member of an HA pair (no IPs)"}
+  - {name: ha-hold, color: "ff9800", description: "HA state indeterminate at last sync; IPs left as they were"}
+netbox_scm_custom_fields:
+  - {name: scm_ha_state, label: "SCM HA state", type: text}
+  - {name: scm_ha_peer, label: "SCM HA peer", type: text}
+  - {name: scm_folder, label: "SCM folder", type: text}
+  - {name: scm_software_version, label: "PAN-OS version", type: text}
+  - {name: scm_connected, label: "SCM connected", type: boolean}
+  - {name: scm_device_id, label: "SCM device id", type: text}

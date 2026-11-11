@@ -1,0 +1,33 @@
+---
+# GET /config/network/v1/<kind>?folder=<folder>   (folder-level intent)
+# GET /config/network/v1/<kind>?device=<serial>   (device-level overrides)
+- name: Refresh SCM token
+  ansible.builtin.include_role:
+    name: scm_auth
+    public: true
+
+- name: Build container list (folders + device serials)
+  ansible.builtin.set_fact:
+    scm_cfg_containers: "{{ scm_cfg_needed | scm_cfg_containers }}"
+
+- name: Read configured interfaces
+  ansible.builtin.uri:
+    url: "{{ scm_api_url }}/config/network/v1/{{ item.0 }}?{{ item.1.type }}={{ item.1.name | urlencode }}&limit=5000"
+    headers: "{{ scm_headers }}"
+    return_content: true
+    status_code: [200, 400, 404]   # 400/404 = nothing defined at that container
+    validate_certs: "{{ scm_validate_certs }}"
+    timeout: "{{ scm_http_timeout }}"
+  loop: "{{ scm_config_interface_kinds | product(scm_cfg_containers) | list }}"
+  loop_control:
+    label: "{{ item.0 }} {{ item.1.type }}={{ item.1.name }}"
+  register: scm_cfg_read
+  check_mode: false
+
+- name: Collect configuration responses
+  ansible.builtin.set_fact:
+    scm_cfg_responses: "{{ scm_cfg_read.results | scm_cfg_collect }}"
+
+- name: Parse configured interfaces
+  ansible.builtin.set_fact:
+    scm_cfg_interfaces: "{{ scm_cfg_responses | scm_parse_cfg_interfaces }}"

@@ -1,0 +1,45 @@
+---
+- name: Authenticate to SCM
+  ansible.builtin.include_role:
+    name: scm_auth
+    public: true
+
+- name: Collect devices
+  ansible.builtin.include_tasks: devices.yml
+
+- name: Collect live interfaces (NGFW Operations API)
+  ansible.builtin.include_tasks: interfaces_operational.yml
+  when: scm_interface_source in ['operational', 'auto']
+
+- name: Decide which devices need configuration data
+  ansible.builtin.set_fact:
+    scm_cfg_needed: >-
+      {{ scm_devices
+         if scm_interface_source == 'config'
+         else (scm_devices | selectattr('serial_number', 'in', scm_op_missing | default([])) | list
+               if (scm_interface_source == 'auto' or scm_fallback_to_config) else []) }}
+
+- name: Collect configured interfaces (NGFW Configuration API)
+  ansible.builtin.include_tasks: interfaces_config.yml
+  when: scm_cfg_needed | length > 0
+
+- name: Dump raw SCM data for verification
+  when: scm_debug_dump_dir | length > 0
+  block:
+    - name: Create dump directory
+      ansible.builtin.file:
+        path: "{{ scm_debug_dump_dir }}"
+        state: directory
+        mode: "0750"
+      check_mode: false
+    - name: Write raw responses
+      ansible.builtin.copy:
+        dest: "{{ scm_debug_dump_dir }}/{{ item.key }}.json"
+        content: "{{ item.value | to_nice_json }}"
+        mode: "0640"
+      check_mode: false
+      loop: "{{ {'devices': scm_devices_raw,
+                 'op_jobs': scm_op_jobs | default([]),
+                 'cfg_responses': scm_cfg_responses | default([])} | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
