@@ -3,7 +3,11 @@
 # Upgrade Gitea binary to a target version
 #
 # Usage:
-#   ansible-playbook gitea/gitea-upgrade.yml -e gitea_target_version=1.26.3
+#   ansible-playbook gitea/gitea-upgrade.yml -e gitea_target_version=28.3.0
+#
+# Note: from 28.0.0 Gitea dropped the "1." prefix (1.27.x -> 28.0.0).
+# Skipping minor versions is supported; migrations run in order on start.
+# Read the breaking changes for every major you cross before running.
 #
 # Flow:
 #   1. Pre-checks (target set, installed version, no accidental downgrade)
@@ -29,7 +33,7 @@
     # version is read from the binary)
     gitea_current_version: "1.26.2"
 
-    # REQUIRED: pass on the command line, e.g. -e gitea_target_version=1.26.3
+    # REQUIRED: pass on the command line, e.g. -e gitea_target_version=28.3.0
     # gitea_target_version: ""
 
     # Set true to allow installing an older version than what is running
@@ -69,7 +73,7 @@
       that:
         - gitea_target_version is defined
         - gitea_target_version | string is match('^\d+\.\d+\.\d+$')
-      fail_msg: "Set gitea_target_version, e.g. -e gitea_target_version=1.26.3 (no leading 'v')"
+      fail_msg: "Set gitea_target_version, e.g. -e gitea_target_version=28.3.0 (no leading 'v')"
 
   - name: Ensure DB password is available for the pre-upgrade dump
     assert:
