@@ -1,0 +1,288 @@
+---
+# ============================================================
+# Upgrade Gitea binary to a target version
+#
+# Usage:
+#   ansible-playbook gitea/gitea-upgrade.yml -e gitea_target_version=28.3.0
+#
+# Note: from 28.0.0 Gitea dropped the "1." prefix (1.27.x -> 28.0.0).
+# Skipping minor versions is supported; migrations run in order on start.
+# Read the breaking changes for every major you cross before running.
+#
+# Flow:
+#   1. Pre-checks (target set, installed version, no accidental downgrade)
+#   2. Download + SHA256-verify the new binary to a staging path
+#   3. pg_dump the database and keep the old binary for rollback
+#   4. Stop Gitea, swap binary, run DB migrations, start Gitea
+#   5. Health check
+#
+# If anything fails BEFORE migrations run, the old binary is put back and
+# Gitea is started again. If it fails AFTER migrations, the DB schema has
+# already moved on, so the play stops and prints the manual rollback steps
+# (restore the pg_dump, then the old binary).
+#
+# For a full backup (repos, data, config) run backup.yml first.
+# ============================================================
+- name: Upgrade Gitea
+  hosts: gitea
+  become: true
+  serial: 1
+
+  vars:
+    # Version currently running (informational - the real installed
+    # version is read from the binary)
+    gitea_current_version: "1.26.2"
+
+    # REQUIRED: pass on the command line, e.g. -e gitea_target_version=28.3.0
+    # gitea_target_version: ""
+
+    # Set true to allow installing an older version than what is running
+    gitea_allow_downgrade: false
+
+    gitea_user: git
+    gitea_service: gitea
+    gitea_binary: /usr/local/bin/gitea
+    gitea_arch: linux-amd64
+
+    gitea_home: /var/lib/gitea
+    gitea_config_dir: /etc/gitea
+    gitea_http_port: 3000
+
+    gitea_download_base: https://dl.gitea.com/gitea
+    gitea_download_url: "{{ gitea_download_base }}/{{ gitea_target_version }}/gitea-{{ gitea_target_version }}-{{ gitea_arch }}"
+    gitea_staging_binary: "/tmp/gitea-{{ gitea_target_version }}-{{ gitea_arch }}"
+
+    # PostgreSQL settings
+    gitea_db_name: gitea
+    gitea_db_user: gitea
+    # gitea_db_password: "{{ gitea_db_password }}"
+
+    # Pre-upgrade backup (DB dump + old binary + app.ini)
+    gitea_upgrade_db_backup: true
+    gitea_upgrade_backup_root: /backup/gitea-upgrade
+    gitea_upgrade_timestamp: "{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}"
+
+  tasks:
+
+  # ============================================================
+  # Pre-checks
+  # ============================================================
+
+  - name: Ensure target version is set
+    assert:
+      that:
+        - gitea_target_version is defined
+        - gitea_target_version | string is match('^\d+\.\d+\.\d+$')
+      fail_msg: "Set gitea_target_version, e.g. -e gitea_target_version=28.3.0 (no leading 'v')"
+
+  - name: Ensure DB password is available for the pre-upgrade dump
+    assert:
+      that:
+        - gitea_db_password is defined
+      fail_msg: "gitea_db_password is not set. Load the vault, or run with -e gitea_upgrade_db_backup=false (not recommended)."
+    when: gitea_upgrade_db_backup | bool
+
+  - name: Read installed Gitea version
+    command: "{{ gitea_binary }} --version"
+    register: gitea_version_out
+    changed_when: false
+
+  - name: Set installed version fact
+    set_fact:
+      gitea_installed_version: "{{ gitea_version_out.stdout | regex_search('version v?(\\d+\\.\\d+\\.\\d+)', '\\1') | first }}"
+
+  - name: Show versions
+    debug:
+      msg:
+        - "Installed: {{ gitea_installed_version }} (expected {{ gitea_current_version }})"
+        - "Target:    {{ gitea_target_version }}"
+
+  - name: Refuse accidental downgrade
+    assert:
+      that:
+        - gitea_allow_downgrade | bool or gitea_target_version is version(gitea_installed_version, '>=')
+      fail_msg: >-
+        Target {{ gitea_target_version }} is older than installed {{ gitea_installed_version }}.
+        Set -e gitea_allow_downgrade=true if you really mean it.
+
+  - name: Skip host if already on target version
+    meta: end_host
+    when: gitea_installed_version == gitea_target_version
+
+  # ============================================================
+  # Download + verify new binary (Gitea still running)
+  # ============================================================
+
+  - name: Download new Gitea binary (SHA256 verified)
+    get_url:
+      url: "{{ gitea_download_url }}"
+      dest: "{{ gitea_staging_binary }}"
+      checksum: "sha256:{{ gitea_download_url }}.sha256"
+      mode: "0755"
+
+  - name: Check new binary runs and reports target version
+    command: "{{ gitea_staging_binary }} --version"
+    register: gitea_new_version_out
+    changed_when: false
+    failed_when: gitea_target_version not in gitea_new_version_out.stdout
+
+  # ============================================================
+  # Pre-upgrade backup
+  # ============================================================
+
+  - name: Set backup directory
+    set_fact:
+      gitea_upgrade_backup_dir: "{{ gitea_upgrade_backup_root }}/{{ gitea_upgrade_timestamp }}-{{ gitea_installed_version }}-to-{{ gitea_target_version }}"
+
+  - name: Create backup directory
+    file:
+      path: "{{ gitea_upgrade_backup_dir }}"
+      state: directory
+      mode: "0750"
+
+  - name: Keep copy of current binary
+    copy:
+      src: "{{ gitea_binary }}"
+      dest: "{{ gitea_upgrade_backup_dir }}/gitea-{{ gitea_installed_version }}"
+      remote_src: true
+      mode: "0755"
+
+  - name: Keep copy of app.ini
+    copy:
+      src: "{{ gitea_config_dir }}/app.ini"
+      dest: "{{ gitea_upgrade_backup_dir }}/app.ini"
+      remote_src: true
+      mode: "0600"
+
+  - name: Backup PostgreSQL database
+    shell: >
+      PGPASSWORD='{{ gitea_db_password }}'
+      pg_dump
+      -h 127.0.0.1
+      -p 5432
+      -U {{ gitea_db_user }}
+      -Fc
+      -f {{ gitea_upgrade_backup_dir }}/postgresql.dump
+      {{ gitea_db_name }}
+    no_log: true
+    changed_when: true
+    when: gitea_upgrade_db_backup | bool
+
+  # ============================================================
+  # Upgrade
+  # ============================================================
+
+  - name: Swap binary, migrate and start
+    block:
+
+      - name: Mark migrations as not yet run
+        set_fact:
+          gitea_migrated: false
+
+      - name: Stop Gitea
+        service:
+          name: "{{ gitea_service }}"
+          state: stopped
+
+      - name: Install new Gitea binary
+        copy:
+          src: "{{ gitea_staging_binary }}"
+          dest: "{{ gitea_binary }}"
+          remote_src: true
+          owner: root
+          group: root
+          mode: "0755"
+
+      - name: Mark migrations as started
+        set_fact:
+          gitea_migrated: true
+
+      - name: Run Gitea database migrations
+        command: >
+          runuser -u {{ gitea_user }} --
+          env GITEA_WORK_DIR={{ gitea_home }} HOME={{ gitea_home }}
+          {{ gitea_binary }} migrate -c {{ gitea_config_dir }}/app.ini
+        args:
+          chdir: "{{ gitea_home }}"
+        changed_when: true
+
+      - name: Start Gitea
+        service:
+          name: "{{ gitea_service }}"
+          state: started
+          enabled: true
+
+      - name: Wait for Gitea HTTP port
+        wait_for:
+          host: 127.0.0.1
+          port: "{{ gitea_http_port }}"
+          timeout: 120
+
+      - name: Gitea health check
+        uri:
+          url: "http://127.0.0.1:{{ gitea_http_port }}/api/healthz"
+          status_code: 200
+        register: gitea_health
+        retries: 12
+        delay: 5
+        until: gitea_health.status == 200
+
+    rescue:
+
+      - name: Restore previous binary (migrations not run)
+        copy:
+          src: "{{ gitea_upgrade_backup_dir }}/gitea-{{ gitea_installed_version }}"
+          dest: "{{ gitea_binary }}"
+          remote_src: true
+          owner: root
+          group: root
+          mode: "0755"
+        when: not gitea_migrated
+
+      - name: Start Gitea on previous version
+        service:
+          name: "{{ gitea_service }}"
+          state: started
+        when: not gitea_migrated
+
+      - name: Upgrade failed
+        fail:
+          msg: >-
+            {{
+              'Upgrade failed before migrations. Rolled back to ' ~ gitea_installed_version ~ ' and started Gitea.'
+              if not gitea_migrated else
+              'Upgrade failed AFTER migrations started. Gitea left as-is. Manual rollback: stop gitea; '
+              ~ 'pg_restore --clean -d ' ~ gitea_db_name ~ ' ' ~ gitea_upgrade_backup_dir ~ '/postgresql.dump; '
+              ~ 'cp ' ~ gitea_upgrade_backup_dir ~ '/gitea-' ~ gitea_installed_version ~ ' ' ~ gitea_binary ~ '; start gitea.'
+            }}
+
+  # ============================================================
+  # Cleanup + summary
+  # ============================================================
+
+  - name: Remove staging binary
+    file:
+      path: "{{ gitea_staging_binary }}"
+      state: absent
+
+  - name: Read running Gitea version
+    command: "{{ gitea_binary }} --version"
+    register: gitea_final_version_out
+    changed_when: false
+
+  - name: Show upgrade summary
+    debug:
+      msg:
+        - "========================================"
+        - "Gitea upgrade complete"
+        - ""
+        - "From: {{ gitea_installed_version }}"
+        - "To:   {{ gitea_target_version }}"
+        - "Binary: {{ gitea_final_version_out.stdout }}"
+        - ""
+        - "Rollback material:"
+        - "  {{ gitea_upgrade_backup_dir }}"
+        - ""
+        - "Remember to bump gitea_version in gitea-deploy.yml"
+        - "and gitea_current_version in this play."
+        - "========================================"
