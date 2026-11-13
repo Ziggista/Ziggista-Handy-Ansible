@@ -1,0 +1,126 @@
+---
+# Clones VM(s) from the Ubuntu 26.04 golden template and hands hostname,
+# static IP, DNS and timezone to cloud-init through VMware guestinfo.
+# Deleting VMs stays with golden/vsphere/vsphere-deploy-ubuntu-vm.yml.
+
+- name: Deploy Ubuntu 26.04 VM(s) from the golden template
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/main.yml
+
+  tasks:
+    - name: Load vault file when present
+      ansible.builtin.include_vars:
+        file: "{{ golden_vault_file }}"
+      when: golden_vault_file is file
+
+    # ------------------------------------------------
+    # Validation
+    # ------------------------------------------------
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - vcenter_hostname is defined
+          - vcenter_username is defined
+          - vcenter_password is defined
+          - vcenter_datacenter is defined
+          - vcenter_cluster is defined
+          - vcenter_datastore is defined
+          - vsphere_network is defined
+          - ubuntu_netmask is defined or ubuntu_prefix is defined
+          - ubuntu_gateway is defined
+          - ubuntu_dns_servers is defined
+          - vm_list | length > 0
+        fail_msg: "Set the vcenter_* placement variables, vsphere_network and the ubuntu_* network defaults."
+
+    - name: Show execution plan
+      ansible.builtin.debug:
+        msg:
+          - "Template: {{ vm_template }}"
+          - "VMs: {{ vm_list | map(attribute='name') | list }}"
+
+    # ------------------------------------------------
+    # Clone with cloud-init guestinfo
+    # ------------------------------------------------
+    - name: Clone VM(s) from template with cloud-init guestinfo
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+
+        datacenter: "{{ vcenter_datacenter }}"
+        cluster: "{{ vcenter_cluster }}"
+        folder: "{{ vcenter_folder | default(omit) }}"
+        name: "{{ item.name }}"
+        template: "{{ item.template | default(vm_template) }}"
+        datastore: "{{ vcenter_datastore }}"
+        state: poweredoff
+
+        hardware:
+          num_cpus: "{{ item.cpu | default(vm_cpu) }}"
+          memory_mb: "{{ item.memory_mb | default(vm_memory_mb) }}"
+
+        disk:
+          - size_gb: "{{ item.disk_gb | default(vm_disk_gb) }}"
+            type: "{{ vm_disk_type }}"
+            datastore: "{{ vcenter_datastore }}"
+
+        networks:
+          - name: "{{ item.network | default(vsphere_network) }}"
+
+        advanced_settings:
+          - key: guestinfo.metadata
+            value: "{{ lookup('ansible.builtin.template', 'guestinfo-metadata.yml.j2') | b64encode }}"
+          - key: guestinfo.metadata.encoding
+            value: base64
+          - key: guestinfo.userdata
+            value: "{{ lookup('ansible.builtin.template', 'guestinfo-userdata.yml.j2') | b64encode }}"
+          - key: guestinfo.userdata.encoding
+            value: base64
+      loop: "{{ vm_list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Power on VM(s) and wait for an address
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        name: "{{ item.name }}"
+        state: poweredon
+        wait_for_ip_address: true
+      loop: "{{ vm_list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Show deployed VM(s)
+      ansible.builtin.debug:
+        msg:
+          - "Deployed VM: {{ item.name }}"
+          - "IP: {{ item.ip }}"
+          - "Template: {{ item.template | default(vm_template) }}"
+      loop: "{{ vm_list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ------------------------------------------------
+    # Dynamic Inventory
+    # ------------------------------------------------
+    - name: Add deployed VM(s) to dynamic inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_host: "{{ item.ip }}"
+        ansible_user: "{{ golden_admin_user }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: "{{ golden_ssh_common_args }}"
+        groups:
+          - ansible_managed_ubuntu
+      loop: "{{ vm_list }}"
+      loop_control:
+        label: "{{ item.name }}"

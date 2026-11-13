@@ -1,0 +1,365 @@
+---
+# Post-deploy stage for new Ubuntu 26.04 VMs: patch, Rapid7 Insight Agent,
+# CrowdStrike Falcon sensor, AD join (realmd / sssd), SSH access control.
+# Safe to re-run. Every stage can be switched off, e.g. -e golden_domain_join=false
+#
+# Runs straight after deploy-vm.yml via site.yml, or on its own against hosts
+# already in the ansible_managed_ubuntu inventory group.
+
+- name: Post-deploy configuration for Ubuntu 26.04
+  hosts: ansible_managed_ubuntu
+  become: true
+  gather_facts: false
+
+  vars_files:
+    - vars/main.yml
+
+  handlers:
+    - name: Restart sssd
+      ansible.builtin.service:
+        name: sssd
+        state: restarted
+
+    - name: Restart ssh
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+  tasks:
+    - name: Load vault file when present
+      ansible.builtin.include_vars:
+        file: "{{ golden_vault_file }}"
+      when: golden_vault_file is file
+
+    # ------------------------------------------------
+    # Validation
+    # ------------------------------------------------
+    - name: Validate Rapid7 variables
+      ansible.builtin.assert:
+        that:
+          - rapid7_token | default('') | length > 0
+          - (rapid7_installer_url | length > 0) or (rapid7_installer_src | length > 0)
+        fail_msg: "Set rapid7_token and one of rapid7_installer_url / rapid7_installer_src."
+        quiet: true
+      when: golden_install_rapid7 | bool
+
+    - name: Validate CrowdStrike variables
+      ansible.builtin.assert:
+        that:
+          - falcon_cid | default('') | length > 0
+          - (falcon_installer_url | length > 0) or (falcon_installer_src | length > 0)
+        fail_msg: "Set falcon_cid and one of falcon_installer_url / falcon_installer_src."
+        quiet: true
+      when: golden_install_crowdstrike | bool
+
+    - name: Validate AD join variables
+      ansible.builtin.assert:
+        that:
+          - ad_domain | length > 0
+          - ad_join_user | default('') | length > 0
+          - ad_join_password | default('') | length > 0
+        fail_msg: "Set ad_domain, ad_join_user and ad_join_password."
+        quiet: true
+      when: golden_domain_join | bool
+
+    # ------------------------------------------------
+    # Wait for the new VM
+    # ------------------------------------------------
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      register: cloud_init_wait
+      changed_when: false
+      failed_when: cloud_init_wait.rc not in [0, 2]
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    # ------------------------------------------------
+    # Updates
+    # ------------------------------------------------
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+      when: golden_post_upgrade | bool
+
+    # ------------------------------------------------
+    # Rapid7 Insight Agent
+    # ------------------------------------------------
+    - name: Install Rapid7 Insight Agent
+      when:
+        - golden_install_rapid7 | bool
+        - ansible_facts.services.get('ir_agent.service', {}).get('state', '') != 'running'
+      block:
+        - name: Download Rapid7 deb
+          ansible.builtin.get_url:
+            url: "{{ rapid7_installer_url }}"
+            dest: "{{ rapid7_remote_deb_path }}"
+            checksum: "{{ rapid7_installer_checksum | default(omit, true) }}"
+            mode: "0644"
+          when: rapid7_installer_url | length > 0
+
+        - name: Copy Rapid7 deb from controller
+          ansible.builtin.copy:
+            src: "{{ rapid7_installer_src }}"
+            dest: "{{ rapid7_remote_deb_path }}"
+            mode: "0644"
+          when: rapid7_installer_url | length == 0
+
+        - name: Install Rapid7 agent
+          ansible.builtin.apt:
+            deb: "{{ rapid7_remote_deb_path }}"
+
+        - name: Find configure_agent.sh
+          ansible.builtin.find:
+            paths: /opt/rapid7/ir_agent/components/insight_agent/
+            patterns: configure_agent.sh
+            recurse: true
+          register: agent_script
+
+        - name: Fail if script not found
+          ansible.builtin.fail:
+            msg: "configure_agent.sh not found"
+          when: agent_script.files | length == 0
+
+        - name: Configure agent with token
+          ansible.builtin.command:
+            argv:
+              - "{{ (agent_script.files | map(attribute='path') | sort | last) }}"
+              - "--token={{ rapid7_token }}"
+              - "-v"
+              - "--start"
+            creates: /etc/opt/rapid7/ir_agent/agent.cfg
+          no_log: true
+
+        - name: Remove Rapid7 deb
+          ansible.builtin.file:
+            path: "{{ rapid7_remote_deb_path }}"
+            state: absent
+
+    - name: Ensure Rapid7 agent service is running
+      ansible.builtin.service:
+        name: ir_agent
+        state: started
+        enabled: true
+      when: golden_install_rapid7 | bool
+
+    # ------------------------------------------------
+    # CrowdStrike Falcon sensor
+    # ------------------------------------------------
+    - name: Install CrowdStrike Falcon sensor
+      when:
+        - golden_install_crowdstrike | bool
+        - ansible_facts.services.get('falcon-sensor.service', {}).get('state', '') != 'running'
+      block:
+        - name: Download Falcon sensor deb
+          ansible.builtin.get_url:
+            url: "{{ falcon_installer_url }}"
+            dest: "{{ falcon_remote_deb_path }}"
+            checksum: "{{ falcon_installer_checksum | default(omit, true) }}"
+            mode: "0644"
+          when: falcon_installer_url | length > 0
+
+        - name: Copy Falcon sensor deb from controller
+          ansible.builtin.copy:
+            src: "{{ falcon_installer_src }}"
+            dest: "{{ falcon_remote_deb_path }}"
+            mode: "0644"
+          when: falcon_installer_url | length == 0
+
+        - name: Install Falcon sensor
+          ansible.builtin.apt:
+            deb: "{{ falcon_remote_deb_path }}"
+
+        - name: Check current Falcon CID
+          ansible.builtin.command: /opt/CrowdStrike/falconctl -g --cid
+          register: falcon_cid_check
+          changed_when: false
+          failed_when: false
+
+        - name: Configure Falcon CID
+          ansible.builtin.command:
+            argv: >-
+              {{
+                ['/opt/CrowdStrike/falconctl', '-s', '-f', '--cid=' ~ falcon_cid]
+                + (['--provisioning-token=' ~ falcon_provisioning_token]
+                   if falcon_provisioning_token | default('') | length > 0 else [])
+              }}
+          changed_when: true
+          no_log: true
+          when: "'cid=' not in falcon_cid_check.stdout | default('')"
+
+        - name: Remove Falcon sensor deb
+          ansible.builtin.file:
+            path: "{{ falcon_remote_deb_path }}"
+            state: absent
+
+    - name: Ensure falcon service is running
+      ansible.builtin.service:
+        name: falcon-sensor
+        state: started
+        enabled: true
+      when: golden_install_crowdstrike | bool
+
+    # ------------------------------------------------
+    # Join Active Directory
+    # ------------------------------------------------
+    - name: Join Active Directory with SSSD
+      when: golden_domain_join | bool
+      block:
+        - name: Install required packages
+          ansible.builtin.apt:
+            name:
+              - realmd
+              - sssd
+              - sssd-tools
+              - adcli
+              - samba-common-bin
+              - oddjob
+              - oddjob-mkhomedir
+              - packagekit
+            state: present
+            update_cache: true
+
+        - name: Check time sync (Kerberos requirement)
+          ansible.builtin.command: timedatectl show --property=NTPSynchronized --value
+          register: ntp_sync
+          changed_when: false
+          failed_when: false
+
+        - name: Warn if the clock is not synchronised
+          ansible.builtin.debug:
+            msg: "Clock is not NTP synchronised yet. The join fails if it is more than 5 minutes off the domain controllers."
+          when: ntp_sync.stdout | default('') | trim != 'yes'
+
+        - name: Check current realm membership
+          ansible.builtin.command: realm list --name-only
+          register: realm_list
+          changed_when: false
+
+        - name: Join the Active Directory domain
+          ansible.builtin.command:
+            argv:
+              - realm
+              - join
+              - "--user={{ ad_join_user }}"
+              - "--computer-ou={{ ad_computer_ou }}"
+              - "{{ ad_domain }}"
+            stdin: "{{ ad_join_password }}"
+          changed_when: true
+          no_log: true
+          when: ad_domain | lower not in (realm_list.stdout_lines | map('lower') | list)
+
+        - name: Enable automatic home directory creation
+          ansible.builtin.command: pam-auth-update --enable mkhomedir
+          changed_when: false
+
+        - name: Ensure shared Linux users group exists
+          ansible.builtin.group:
+            name: "{{ linux_default_group }}"
+            gid: "{{ linux_default_gid }}"
+            state: present
+
+        - name: Configure SSSD access control
+          ansible.builtin.blockinfile:
+            path: /etc/sssd/sssd.conf
+            marker: "# {mark} ANSIBLE MANAGED SSSD SETTINGS"
+            insertafter: '^\[domain/'
+            block: |
+              access_provider = simple
+              simple_allow_groups = {{ ad_auth_groups | join(',') }}
+              use_fully_qualified_names = False
+              override_gid = {{ linux_default_gid }}
+              fallback_homedir = /home/%u
+              default_shell = /bin/bash
+              ignore_group_members = true
+              enumerate = false
+          notify: Restart sssd
+
+        - name: Ensure correct permissions on sssd.conf
+          ansible.builtin.file:
+            path: /etc/sssd/sssd.conf
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: Configure sudo access for AD admins
+          ansible.builtin.copy:
+            dest: /etc/sudoers.d/ad-admins
+            content: "%{{ ad_sudo_group }} ALL=(ALL) ALL\n"
+            owner: root
+            group: root
+            mode: "0440"
+            validate: /usr/sbin/visudo -cf %s
+
+        # ------------------------------------------------
+        # SSH access control
+        # ------------------------------------------------
+        - name: Ensure local SSH access group exists
+          ansible.builtin.group:
+            name: local-ssh-allowed
+            state: present
+
+        - name: Look up local accounts that must keep SSH access
+          ansible.builtin.getent:
+            database: passwd
+            service: files
+
+        - name: Add local accounts to the SSH access group
+          ansible.builtin.user:
+            name: "{{ item }}"
+            groups: local-ssh-allowed
+            append: true
+          loop: "{{ golden_local_ssh_users }}"
+          when: item in ansible_facts.getent_passwd
+
+        - name: Configure SSH access control
+          ansible.builtin.copy:
+            dest: /etc/ssh/sshd_config.d/60-rrc-access.conf
+            content: |
+              # Managed by Ansible (golden/ubuntu-2604/post-deploy.yml)
+              AllowGroups local-ssh-allowed {{ ad_auth_groups | map('lower') | join(' ') }}
+              PermitRootLogin no
+            owner: root
+            group: root
+            mode: "0644"
+            validate: /usr/sbin/sshd -t -f %s
+          notify: Restart ssh
+
+    - name: Apply sssd and ssh changes now
+      ansible.builtin.meta: flush_handlers
+
+    # ------------------------------------------------
+    # Reboot
+    # ------------------------------------------------
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot if required
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+      when:
+        - golden_post_reboot | bool
+        - reboot_required.stat.exists
+
+    # ------------------------------------------------
+    # Summary
+    # ------------------------------------------------
+    - name: Refresh service facts
+      ansible.builtin.service_facts:
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg:
+          - "Rapid7 ir_agent: {{ ansible_facts.services.get('ir_agent.service', {}).get('state', 'not installed') }}"
+          - "CrowdStrike falcon-sensor: {{ ansible_facts.services.get('falcon-sensor.service', {}).get('state', 'not installed') }}"
+          - "SSSD: {{ ansible_facts.services.get('sssd.service', {}).get('state', 'not installed') }}"

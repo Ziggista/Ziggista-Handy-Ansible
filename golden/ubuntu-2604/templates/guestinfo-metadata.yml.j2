@@ -1,0 +1,17 @@
+instance-id: {{ item.name }}
+local-hostname: {{ item.name }}
+network:
+  version: 2
+  ethernets:
+    nic0:
+      match:
+        name: "en*"
+      dhcp4: false
+      addresses:
+        - {{ item.ip }}/{{ item.prefix | default(golden_prefix) }}
+      routes:
+        - to: default
+          via: {{ item.gateway | default(ubuntu_gateway) }}
+      nameservers:
+        addresses: {{ ubuntu_dns_servers | to_json }}
+        search: [{{ ubuntu_domain }}]

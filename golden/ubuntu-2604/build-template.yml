@@ -1,0 +1,234 @@
+---
+# Builds the Ubuntu 26.04 golden template on vSphere from the official Ubuntu
+# cloud image OVA:
+#   1. deploy the OVA as a temporary build VM
+#   2. patch it, bake in the cloud-init datasource config, users and SSH keys
+#   3. seal it (cloud-init clean, machine-id, host keys) and convert to template
+#
+# ansible-playbook golden/ubuntu-2604/build-template.yml --ask-vault-pass
+
+- name: Deploy Ubuntu 26.04 cloud image as build VM
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/main.yml
+
+  tasks:
+    - name: Load vault file when present
+      ansible.builtin.include_vars:
+        file: "{{ golden_vault_file }}"
+      when: golden_vault_file is file
+
+    # ------------------------------------------------
+    # Validation
+    # ------------------------------------------------
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - vcenter_hostname is defined
+          - vcenter_username is defined
+          - vcenter_password is defined
+          - vcenter_datacenter is defined
+          - vcenter_cluster is defined
+          - vcenter_datastore is defined
+          - vsphere_network is defined
+          - golden_admin_pubkeys | length > 0
+        fail_msg: >-
+          Set the vcenter_* placement variables, vsphere_network and at least
+          one key in golden_admin_pubkeys (see vars/vault.yml.example).
+
+    - name: Validate static build address settings
+      ansible.builtin.assert:
+        that:
+          - ubuntu_netmask is defined or ubuntu_prefix is defined
+          - ubuntu_gateway is defined
+          - ubuntu_dns_servers is defined
+        fail_msg: "golden_build_ip needs ubuntu_netmask, ubuntu_gateway and ubuntu_dns_servers."
+      when: golden_build_ip | length > 0
+
+    - name: Check whether the template name is already in use
+      community.vmware.vmware_guest_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        name: "{{ ubuntu_2604_template }}"
+      register: existing_template
+      failed_when: false
+
+    - name: Stop if the template already exists
+      ansible.builtin.fail:
+        msg: >-
+          '{{ ubuntu_2604_template }}' already exists in vCenter. Rename or
+          delete it, or build under a new name with -e ubuntu_2604_template=...
+      when: existing_template.instance is defined
+
+    # ------------------------------------------------
+    # Deploy OVA
+    # ------------------------------------------------
+    - name: Download Ubuntu 26.04 cloud image OVA
+      ansible.builtin.get_url:
+        url: "{{ golden_ova_url }}"
+        dest: "{{ golden_ova_cache_dir }}/{{ golden_ova_url | basename }}"
+        checksum: "{{ golden_ova_checksum | default(omit, true) }}"
+        mode: "0644"
+
+    - name: Deploy OVA as build VM
+      community.vmware.vmware_deploy_ovf:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        cluster: "{{ vcenter_cluster }}"
+        folder: "{{ vcenter_folder | default(omit) }}"
+        datastore: "{{ vcenter_datastore }}"
+        name: "{{ ubuntu_2604_template }}"
+        ovf: "{{ golden_ova_cache_dir }}/{{ golden_ova_url | basename }}"
+        networks: "{{ {golden_ova_network_name: vsphere_network} }}"
+        disk_provisioning: "{{ golden_template_disk_provisioning }}"
+        allow_duplicates: false
+        inject_ovf_env: true
+        properties:
+          hostname: "{{ ubuntu_2604_template }}"
+          instance-id: "{{ ubuntu_2604_template }}-build"
+          user-data: "{{ lookup('ansible.builtin.template', 'build-userdata.yml.j2') | b64encode }}"
+        power_on: true
+        wait: true
+        wait_for_ip_address: true
+      register: build_vm
+
+    - name: Add build VM to dynamic inventory
+      ansible.builtin.add_host:
+        name: "{{ ubuntu_2604_template }}"
+        ansible_host: "{{ golden_build_ip | default(build_vm.instance.ipv4, true) }}"
+        ansible_user: "{{ golden_admin_user }}"
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: "{{ golden_ssh_common_args }}"
+        groups:
+          - golden_build
+
+- name: Prepare and seal the golden image
+  hosts: golden_build
+  become: true
+  gather_facts: false
+
+  vars_files:
+    - vars/main.yml
+
+  tasks:
+    - name: Load vault file when present
+      ansible.builtin.include_vars:
+        file: "{{ golden_vault_file }}"
+      when: golden_vault_file is file
+
+    - name: Wait for SSH on the build VM
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+
+    - name: Wait for first-boot cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      register: cloud_init_wait
+      changed_when: false
+      failed_when: cloud_init_wait.rc not in [0, 2]
+
+    # ------------------------------------------------
+    # Packages
+    # ------------------------------------------------
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: dist
+
+    - name: Install template packages
+      ansible.builtin.apt:
+        name: "{{ golden_template_packages }}"
+        state: present
+
+    - name: Remove unused packages
+      ansible.builtin.apt:
+        autoremove: true
+        clean: true
+
+    - name: Ensure open-vm-tools is enabled
+      ansible.builtin.service:
+        name: open-vm-tools
+        enabled: true
+        state: started
+
+    # ------------------------------------------------
+    # cloud-init config, users and SSH keys
+    # ------------------------------------------------
+    - name: Bake cloud-init datasource, users and SSH keys into the image
+      ansible.builtin.template:
+        src: 99-rrc-golden.cfg.j2
+        dest: /etc/cloud/cloud.cfg.d/99-rrc-golden.cfg
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Validate the cloud-init config
+      ansible.builtin.command: cloud-init schema --config-file /etc/cloud/cloud.cfg.d/99-rrc-golden.cfg
+      changed_when: false
+
+    # ------------------------------------------------
+    # Seal
+    # ------------------------------------------------
+    - name: Remove build-only network config
+      ansible.builtin.file:
+        path: /etc/netplan/99-golden-build.yaml
+        state: absent
+
+    - name: Remove SSH host keys
+      ansible.builtin.shell: rm -f /etc/ssh/ssh_host_*
+      changed_when: true
+
+    - name: Reset cloud-init and machine-id so every clone boots as a new instance
+      ansible.builtin.command: cloud-init clean --logs --seed --machine-id
+      changed_when: true
+
+    - name: Flush filesystem buffers
+      ansible.builtin.command: sync
+      changed_when: false
+
+- name: Convert the build VM to a template
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars_files:
+    - vars/main.yml
+
+  tasks:
+    - name: Load vault file when present
+      ansible.builtin.include_vars:
+        file: "{{ golden_vault_file }}"
+      when: golden_vault_file is file
+
+    - name: Shut down the build VM
+      community.vmware.vmware_guest_powerstate:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        name: "{{ ubuntu_2604_template }}"
+        state: shutdown-guest
+        state_change_timeout: 300
+
+    - name: Convert to template
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        name: "{{ ubuntu_2604_template }}"
+        is_template: true
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "Template '{{ ubuntu_2604_template }}' is ready. Deploy with deploy-vm.yml or site.yml."

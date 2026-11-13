@@ -1,0 +1,8 @@
+#cloud-config
+# Per-VM settings. Users and SSH keys come from the config baked into the
+# template (/etc/cloud/cloud.cfg.d/99-rrc-golden.cfg), so they are not repeated.
+hostname: {{ item.name }}
+fqdn: {{ item.name }}.{{ ubuntu_domain }}
+prefer_fqdn_over_hostname: false
+manage_etc_hosts: true
+timezone: {{ ubuntu_timezone }}
