@@ -1,0 +1,37 @@
+#cloud-config
+# First-boot config for the temporary build VM only (passed as the OVA
+# user-data vApp property). Nothing here survives into the template.
+ssh_pwauth: false
+users:
+  - name: {{ golden_admin_user }}
+    shell: /bin/bash
+    groups: [sudo]
+    lock_passwd: true
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+{% for key in golden_admin_pubkeys %}
+      - {{ key | trim }}
+{% endfor %}
+{% if golden_build_ip | length > 0 %}
+write_files:
+  - path: /etc/netplan/99-golden-build.yaml
+    permissions: "0600"
+    content: |
+      network:
+        version: 2
+        ethernets:
+          golden-build:
+            match:
+              name: "en*"
+            dhcp4: false
+            addresses:
+              - {{ golden_build_ip }}/{{ golden_prefix }}
+            routes:
+              - to: default
+                via: {{ ubuntu_gateway }}
+            nameservers:
+              addresses: {{ ubuntu_dns_servers | to_json }}
+              search: [{{ ubuntu_domain }}]
+runcmd:
+  - [netplan, apply]
+{% endif %}

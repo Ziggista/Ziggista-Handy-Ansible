@@ -1,0 +1,30 @@
+# Managed by Ansible (golden/ubuntu-2604/build-template.yml)
+# Baked into the golden image. Every clone re-runs cloud-init with this config
+# plus the guestinfo metadata/userdata set by deploy-vm.yml.
+
+# Only read VMware guestinfo. This also stops the OVF datasource picking up
+# the vApp properties the template inherits from the Ubuntu OVA.
+datasource_list: [VMware, None]
+datasource:
+  VMware:
+    allow_raw_data: true
+
+disable_root: true
+ssh_pwauth: false
+ssh_deletekeys: true
+preserve_hostname: false
+manage_etc_hosts: true
+
+users:
+{% for user in golden_users %}
+  - name: {{ user.name }}
+    gecos: {{ user.gecos | default(user.name) }}
+    shell: /bin/bash
+    groups: [sudo]
+    lock_passwd: true
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+{% for key in user.pubkeys %}
+      - {{ key | trim }}
+{% endfor %}
+{% endfor %}

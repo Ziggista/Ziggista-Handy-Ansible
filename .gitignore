@@ -1,0 +1,3 @@
+
+# Ansible vault / local secrets
+golden/ubuntu-2604/vars/vault.yml

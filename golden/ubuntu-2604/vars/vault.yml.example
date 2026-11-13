@@ -1,0 +1,26 @@
+---
+# Copy to vars/vault.yml, fill in, then encrypt:
+#   ansible-vault encrypt golden/ubuntu-2604/vars/vault.yml
+# vars/vault.yml is git-ignored. In AWX, supply the same variable names from a
+# custom credential type or a vaulted extra-vars file instead.
+
+vcenter_hostname: "CHANGEME"
+vcenter_username: "CHANGEME"
+vcenter_password: "CHANGEME"
+
+# SSH public keys allowed to log in as template_admin on every clone
+golden_admin_pubkeys:
+  - "ssh-ed25519 CHANGEME comment"
+
+# Rapid7 Insight Agent
+rapid7_token: "CHANGEME"
+rapid7_installer_url: "https://CHANGEME/rapid7-insight-agent_amd64.deb"
+
+# CrowdStrike Falcon
+falcon_cid: "CHANGEME"
+falcon_installer_url: "https://CHANGEME/falcon-sensor_amd64.deb"
+# falcon_provisioning_token: "CHANGEME"
+
+# AD join account
+ad_join_user: "CHANGEME"
+ad_join_password: "CHANGEME"

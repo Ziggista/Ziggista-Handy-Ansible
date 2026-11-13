@@ -1,0 +1,140 @@
+---
+# Non-secret defaults for the Ubuntu 26.04 golden image and deploy.
+# Override with -e / AWX extra vars or survey, or in vars/vault.yml.
+# NOTE: this file is loaded with vars_files, which beats inventory group_vars,
+# so a value set here cannot be changed from inventory. The commented-out
+# variables are not set here and can come from inventory as usual.
+# Secrets live in vars/vault.yml (see vault.yml.example) or an AWX credential.
+
+# ------------------------------------------------
+# vCenter placement
+# (same variable names as golden/vsphere/vsphere-deploy-ubuntu-vm.yml)
+# ------------------------------------------------
+# vcenter_hostname, vcenter_username, vcenter_password: vault / AWX credential
+vcenter_validate_certs: true
+# vcenter_datacenter: ""
+# vcenter_cluster: ""
+# vcenter_folder: ""
+# vcenter_datastore: ""
+# vsphere_network: ""
+
+# ------------------------------------------------
+# Guest network defaults
+# ------------------------------------------------
+# ubuntu_netmask: "255.255.255.0"
+# ubuntu_gateway: ""
+# ubuntu_dns_servers: []
+ubuntu_domain: "rrc.local"
+ubuntu_timezone: "Australia/Brisbane"
+# CIDR prefix, worked out from ubuntu_netmask unless ubuntu_prefix is set
+golden_octet_bits: {255: 8, 254: 7, 252: 6, 248: 5, 240: 4, 224: 3, 192: 2, 128: 1, 0: 0}
+golden_prefix: >-
+  {{ ubuntu_prefix | default(ubuntu_netmask.split('.') | map('int')
+     | map('extract', golden_octet_bits) | sum) }}
+
+# ------------------------------------------------
+# Template build
+# ------------------------------------------------
+ubuntu_2604_template: "ubuntu-2604-golden"
+golden_ova_url: "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.ova"
+# Optional, e.g. "sha256:<hash from the SHA256SUMS file next to the OVA>"
+golden_ova_checksum: ""
+golden_ova_cache_dir: "/tmp"
+# Name of the network inside the Ubuntu OVA that gets mapped to vsphere_network
+golden_ova_network_name: "VM Network"
+golden_template_disk_provisioning: "thin"
+# Static address for the temporary build VM. Leave empty to use DHCP.
+golden_build_ip: ""
+golden_template_packages:
+  - open-vm-tools
+  - cloud-guest-utils
+  - python3
+  - python3-apt
+  - ca-certificates
+  - curl
+
+# ------------------------------------------------
+# Users and SSH keys baked into the image
+# ------------------------------------------------
+golden_admin_user: "template_admin"
+# Public keys allowed to log in as golden_admin_user. Must include the key
+# Ansible / AWX connects with. Public keys are not secret, but keep the list
+# in vault.yml or inventory if you would rather not commit it.
+golden_admin_pubkeys: []
+golden_awx_user: "svc_awx_linux"
+golden_awx_pubkeys:
+  - "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../ubuntu/files/svc_awx_linux_ed25519.pub') }}"
+golden_users:
+  - name: "{{ golden_admin_user }}"
+    gecos: "Template admin"
+    pubkeys: "{{ golden_admin_pubkeys }}"
+  - name: "{{ golden_awx_user }}"
+    gecos: "AWX service account"
+    pubkeys: "{{ golden_awx_pubkeys }}"
+
+# Fresh clones have new host keys every time, so do not pin them on first contact
+golden_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+# ------------------------------------------------
+# VM deploy
+# ------------------------------------------------
+vm_name: "test-ansible-01"
+vm_ip: "172.19.2.201"
+vm_cpu: 4
+vm_memory_mb: 8192
+vm_disk_gb: 60
+vm_disk_type: "thin"
+vm_template: "{{ ubuntu_2604_template }}"
+# Optional per-VM keys: template, network, cpu, memory_mb, disk_gb, prefix, gateway
+vm_list:
+  - name: "{{ vm_name }}"
+    ip: "{{ vm_ip }}"
+
+# ------------------------------------------------
+# Post-deploy switches
+# ------------------------------------------------
+# Optional encrypted vars file, loaded when it exists
+golden_vault_file: "{{ playbook_dir }}/vars/vault.yml"
+golden_post_upgrade: true
+golden_install_rapid7: true
+golden_install_crowdstrike: true
+golden_domain_join: true
+golden_post_reboot: true
+
+# ------------------------------------------------
+# Rapid7 Insight Agent
+# ------------------------------------------------
+# Set ONE of these. *_url is downloaded by the new VM, *_src is copied from
+# the controller / execution environment.
+rapid7_installer_url: ""
+rapid7_installer_src: ""
+rapid7_installer_checksum: ""
+rapid7_remote_deb_path: "/tmp/rapid7-agent.deb"
+# rapid7_token: vault / AWX credential
+
+# ------------------------------------------------
+# CrowdStrike Falcon sensor
+# ------------------------------------------------
+falcon_installer_url: ""
+falcon_installer_src: ""
+falcon_installer_checksum: ""
+falcon_remote_deb_path: "/tmp/falcon-sensor.deb"
+# falcon_cid: vault / AWX credential
+# falcon_provisioning_token: optional, vault / AWX credential
+
+# ------------------------------------------------
+# Active Directory join (realmd / sssd)
+# ------------------------------------------------
+ad_domain: "rrc.local"
+ad_computer_ou: "OU=LINUX,OU=Servers,OU=RRC,DC=RRC,DC=LOCAL"
+# ad_join_user, ad_join_password: vault / AWX credential
+# AD groups allowed to SSH in. The sudo group is always allowed as well.
+ad_ssh_groups: []
+ad_sudo_group: "IT_Linux_Admins"
+ad_auth_groups: "{{ (ad_ssh_groups + [ad_sudo_group]) | unique }}"
+linux_default_group: "linux_users"
+linux_default_gid: 10000
+# Local accounts that must keep SSH access once AllowGroups is enforced
+golden_local_ssh_users:
+  - "{{ golden_admin_user }}"
+  - "{{ golden_awx_user }}"

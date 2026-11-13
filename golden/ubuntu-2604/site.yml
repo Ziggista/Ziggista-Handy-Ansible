@@ -1,0 +1,12 @@
+---
+# One-shot: clone new VM(s) from the golden template, then run the post-deploy
+# stage (patching, Rapid7, CrowdStrike, AD join) against them.
+#
+# ansible-playbook golden/ubuntu-2604/site.yml --ask-vault-pass \
+#   -e vm_name=p-example-01 -e vm_ip=172.19.2.50
+
+- name: Deploy VM(s) from the golden template
+  ansible.builtin.import_playbook: deploy-vm.yml
+
+- name: Post-deploy configuration
+  ansible.builtin.import_playbook: post-deploy.yml
