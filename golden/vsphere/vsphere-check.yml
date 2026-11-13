@@ -1,0 +1,21 @@
+
+---
+- name: Test vSphere connectivity
+  hosts: vsphere
+  gather_facts: no
+
+  tasks:
+    - name: Authenticate to vCenter API
+      ansible.builtin.uri:
+        url: "https://{{ vcenter_hostname }}/rest/com/vmware/cis/session"
+        method: POST
+        user: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        force_basic_auth: yes
+        validate_certs: false
+      register: login
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "Connected to vCenter successfully"
+      when: login.status == 200

@@ -1,0 +1,11 @@
+---
+- name: Build Netdisco Server
+  hosts: netdisco
+  become: true
+
+  roles:
+  - role: netdisco-postgresql
+    tags: [postgresql]
+
+  - role: netdisco-web
+    tags: [netdisco]

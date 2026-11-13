@@ -1,0 +1,141 @@
+---
+- name: Configure AWX SMTP settings via AWX API
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # AWX API
+    awx_url: "https://awx.rrc.local"
+    awx_admin_user: "dixk_a"
+    awx_validate_certs: true
+    awx_smtp_settings_endpoint: "{{ awx_url }}/api/v2/settings/system/"
+
+    # SMTP Settings
+    smtp_host: "webmail.rrc.qld.gov.au"
+    smtp_port: 587
+    smtp_use_tls: true
+    # smtp_use_ssl: false
+    smtp_timeout: 30
+
+    smtp_username: "svc_awx_smtp@rrc.local"
+    smtp_from: "svc_awx@rrc.qld.gov.au"
+
+
+  vars_prompt:
+    - name: awx_admin_password
+      prompt: "Enter AWX admin password"
+      private: true
+
+    - name: smtp_password
+      prompt: "Enter SMTP password (leave blank if not required)"
+      private: true
+      default: ""
+
+  tasks:
+
+    - name: Confirm AWX API is reachable
+      ansible.builtin.uri:
+        url: "{{ awx_url }}/api/v2/ping/"
+        method: GET
+        user: "{{ awx_admin_user }}"
+        password: "{{ awx_admin_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ awx_validate_certs }}"
+        status_code: 200
+      register: awx_ping
+      changed_when: false
+      no_log: true
+
+    - name: Show AWX API status
+      ansible.builtin.debug:
+        msg: "AWX API is reachable at {{ awx_url }}"
+
+    - name: Ensure local AWX backup directory exists
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/ansible-lab/backups/awx"
+        state: directory
+        mode: "0700"
+
+    - name: Read current AWX SMTP settings
+      ansible.builtin.uri:
+        url: "{{ awx_smtp_settings_endpoint }}"
+        method: GET
+        user: "{{ awx_admin_user }}"
+        password: "{{ awx_admin_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ awx_validate_certs }}"
+        status_code: 200
+        return_content: true
+      register: awx_smtp_before
+      changed_when: false
+      no_log: true
+
+    - name: Save current SMTP settings backup locally
+      ansible.builtin.copy:
+        dest: "{{ lookup('env', 'HOME') }}/ansible-lab/backups/awx/awx_smtp_settings_before.json"
+        content: "{{ awx_smtp_before.json | to_nice_json }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Build AWX SMTP settings payload
+      ansible.builtin.set_fact:
+        awx_smtp_payload:
+          EMAIL_HOST: "{{ smtp_host }}"
+          EMAIL_PORT: "{{ smtp_port }}"
+          EMAIL_USE_TLS: "{{ smtp_use_tls }}"
+          EMAIL_HOST_USER: "{{ smtp_username }}"
+          EMAIL_HOST_PASSWORD: "{{ smtp_password }}"
+          EMAIL_TIMEOUT: "{{ smtp_timeout }}"
+          DEFAULT_FROM_EMAIL: "{{ smtp_from }}"
+          SERVER_EMAIL: "{{ smtp_from }}"
+      no_log: true
+
+    - name: Apply AWX SMTP settings via API
+      ansible.builtin.uri:
+        url: "{{ awx_smtp_settings_endpoint }}"
+        method: PATCH
+        user: "{{ awx_admin_user }}"
+        password: "{{ awx_admin_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ awx_validate_certs }}"
+        status_code: 200
+        body_format: json
+        body: "{{ awx_smtp_payload }}"
+        return_content: true
+      register: awx_smtp_patch
+      no_log: true
+
+    - name: SMTP settings applied
+      ansible.builtin.debug:
+        msg:
+          - "AWX SMTP settings applied."
+          - "SMTP Host: {{ smtp_host }}"
+          - "SMTP Port: {{ smtp_port }}"
+          - "TLS Enabled: {{ smtp_use_tls }}"
+          - "From Address: {{ smtp_from }}"
+          - "Backup saved to ~/ansible-lab/backups/awx/awx_smtp_settings_before.json"
+
+    - name: Read back AWX SMTP settings
+      ansible.builtin.uri:
+        url: "{{ awx_url }}/api/v2/settings/all/"
+        method: GET
+        user: "{{ awx_admin_user }}"
+        password: "{{ awx_admin_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ awx_validate_certs }}"
+        status_code: 200
+        return_content: true
+      register: awx_smtp_after
+      changed_when: false
+      no_log: false
+
+
+    - name: Show safe SMTP read-back summary
+      ansible.builtin.debug:
+        msg:
+          - "EMAIL_HOST: {{ awx_smtp_after.json.EMAIL_HOST.value | default('not returned') }}"
+          - "EMAIL_PORT: {{ awx_smtp_after.json.EMAIL_PORT.value | default('not returned') }}"
+          - "EMAIL_USE_TLS: {{ awx_smtp_after.json.EMAIL_USE_TLS.value | default('not returned') }}"
+          - "EMAIL_USE_SSL: {{ awx_smtp_after.json.EMAIL_USE_SSL.value | default('not returned') }}"
+          - "EMAIL_HOST_USER: {{ awx_smtp_after.json.EMAIL_HOST_USER.value | default('not returned') }}"
+          - "DEFAULT_FROM_EMAIL: {{ awx_smtp_after.json.DEFAULT_FROM_EMAIL.value | default('not returned') }}"

@@ -1,0 +1,36 @@
+
+- name: Configure LDAP CA trust on Gitea host
+  hosts: ansible_managed_ubuntu
+  become: true
+
+  vars:
+    ca_cert_src: /home/dixk/ansible-lab/CertSrv-2036-4096.cer
+    ca_cert_dest: /usr/local/share/ca-certificates/rrc-ca.crt
+
+    ca_cert_src_old: /home/dixk/ansible-lab/CertSrv-2036.cer
+    ca_cert_dest_old: /usr/local/share/ca-certificates/rrc-root-ca.old.crt
+
+
+    # ca_cert_dest: /var/snap/microk8s/current/certs/rrc-root-ca.crt
+
+  tasks:
+
+    - name: Copy CA certificate
+      copy:
+        src: "{{ ca_cert_src }}"
+        dest: "{{ ca_cert_dest }}"
+        mode: '0644'
+
+    - name: Copy CA certificate old
+      copy:
+        src: "{{ ca_cert_src_old }}"
+        dest: "{{ ca_cert_dest_old }}"
+        mode: '0644'
+
+    - name: Update CA trust store
+      command: update-ca-certificates
+
+    # - name: Restart Gitea
+    #   service:
+    #     name: gitea
+    #     state: restarted

@@ -1,0 +1,26 @@
+---
+- name: Get VM info from vSphere
+  hosts: vsphere
+  gather_facts: no
+
+  vars:
+    target_vm: "P-UISP-01"
+
+  tasks:
+    - name: Gather VM info
+      community.vmware.vmware_vm_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: true
+      register: vm_info
+
+    - name: Show VM power state
+      ansible.builtin.debug:
+        msg: "{{ vm.guest_name }} is {{ vm.power_state }}"
+      vars:
+        vm: "{{ vm_info.virtual_machines
+               | selectattr('guest_name', 'equalto', target_vm)
+               | first }}"
+
+

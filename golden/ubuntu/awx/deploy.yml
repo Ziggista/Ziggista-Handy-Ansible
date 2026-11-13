@@ -1,0 +1,218 @@
+- name: Deploy AWX with custom CA baked into image
+  hosts: P-AWX-01
+  become: true
+
+  vars:
+    awx_namespace: awx
+    user_home: "/home/{{ ansible_user }}"
+
+    # CA
+    tls_dir: /opt/awx/tls
+    ca_cert_src: /home/dixk/ansible-lab/CertSrv-2036.cer
+    ca_cert_dest: rrc-ca.crt
+
+    # Image
+    awx_base_image: quay.io/ansible/awx:24.2.0
+    awx_custom_image: awx-custom-ca:24.2.0
+
+  tasks:
+
+  # ---------------------------
+  # Ensure prerequisites
+  # ---------------------------
+  - name: Install docker
+    apt:
+      name: docker.io
+      state: present
+      update_cache: yes
+
+  - name: Ensure docker is running
+    service:
+      name: docker
+      state: started
+      enabled: true
+
+  # ---------------------------
+  # Prepare directories
+  # ---------------------------
+  - name: Create AWX directory
+    file:
+      path: /opt/awx
+      state: directory
+      owner: "{{ ansible_user }}"
+      group: "{{ ansible_user }}"
+      mode: '0755'
+
+  - name: Create TLS directory
+    file:
+      path: "{{ tls_dir }}"
+      state: directory
+      owner: "{{ ansible_user }}"
+      group: "{{ ansible_user }}"
+      mode: '0755'
+
+  # ---------------------------
+  # Copy CA
+  # ---------------------------
+  - name: Copy CA cert
+    copy:
+      src: "{{ ca_cert_src }}"
+      dest: "{{ tls_dir }}/{{ ca_cert_dest }}"
+      owner: "{{ ansible_user }}"
+      group: "{{ ansible_user }}"
+      mode: '0644'
+
+  # ---------------------------
+  # Create Dockerfile
+  # ---------------------------
+  - name: Create Dockerfile
+    copy:
+      dest: /opt/awx/Dockerfile
+      content: |
+        FROM {{ awx_base_image }}
+
+        USER root
+
+        COPY {{ ca_cert_dest }} /etc/pki/ca-trust/source/anchors/{{ ca_cert_dest }}
+        RUN update-ca-trust
+
+        USER 1000
+
+  # ---------------------------
+  # Copy CA into build context
+  # ---------------------------
+  - name: Copy CA into build dir
+    copy:
+      src: "{{ tls_dir }}/{{ ca_cert_dest }}"
+      dest: "/opt/awx/{{ ca_cert_dest }}"
+      remote_src: true
+
+  # ---------------------------
+  # Build image
+  # ---------------------------
+  - name: Build custom AWX image
+    command: >
+      docker build -t {{ awx_custom_image }} /opt/awx
+
+  # ---------------------------
+  # Save image to tar
+  # ---------------------------
+  - name: Save image to tar
+    command: >
+      docker save {{ awx_custom_image }} -o /opt/awx/awx-custom.tar
+
+  # ---------------------------
+  # Import into MicroK8s
+  # ---------------------------
+  - name: Import image into MicroK8s
+    command: microk8s ctr image import /opt/awx/awx-custom.tar
+
+  # ---------------------------
+  # Deploy AWX operator (same as your working code)
+  # ---------------------------
+  - name: Create kustomization.yaml
+    copy:
+      dest: /opt/awx/kustomization.yaml
+      content: |
+        apiVersion: kustomize.config.k8s.io/v1beta1
+        kind: Kustomization
+
+        resources:
+          - github.com/ansible/awx-operator//config/default?ref=2.15.0
+
+        namespace: {{ awx_namespace }}
+
+        images:
+          - name: quay.io/ansible/awx-operator
+            newTag: 2.15.0
+
+          - name: gcr.io/kubebuilder/kube-rbac-proxy
+            newName: docker.io/kubebuilder/kube-rbac-proxy
+            newTag: v0.15.0
+
+
+  - name: Create namespace
+    command: microk8s kubectl create namespace {{ awx_namespace }}
+    ignore_errors: true
+
+  - name: Render operator
+    command: kubectl kustomize /opt/awx
+    register: operator_yaml
+
+  - name: Apply operator
+    command: microk8s kubectl apply -f -
+    args:
+      stdin: "{{ operator_yaml.stdout }}"
+  
+  - name: Wait for operator to be ready
+    shell: |
+      microk8s kubectl get pods -n {{ awx_namespace }} \
+      -l control-plane=controller-manager \
+      -o jsonpath="{.items[0].status.containerStatuses[0].ready}"
+    register: operator_ready
+    retries: 20
+    delay: 10
+    until: operator_ready.stdout == "true"
+    changed_when: false
+
+
+  # ---------------------------
+  # Deploy AWX using custom image
+  # ---------------------------
+  - name: Create AWX instance
+    copy:
+      dest: /opt/awx/awx.yaml
+      content: |
+        apiVersion: awx.ansible.com/v1beta1
+        kind: AWX
+        metadata:
+          name: awx
+          namespace: {{ awx_namespace }}
+
+        spec:
+          service_type: nodeport
+          nodeport_port: 30080
+          image: "{{ awx_custom_image.split(':')[0] }}"
+          image_version: "{{ awx_custom_image.split(':')[1] }}"
+          image_pull_policy: IfNotPresent
+          projects_persistence: true
+          projects_storage_size: 5Gi
+          postgres_storage_class: microk8s-hostpath
+
+
+  - name: Apply AWX instance
+    command: microk8s kubectl apply -f /opt/awx/awx.yaml
+
+  # ---------------------------
+  # Wait for AWX
+  # ---------------------------
+  - name: Wait for AWX pod
+    shell: |
+      microk8s kubectl get pods -n {{ awx_namespace }} \
+      -l app.kubernetes.io/name=awx-web \
+      -o jsonpath="{.items[0].status.phase}"
+    register: awx_status
+    retries: 40
+    delay: 15
+    until: awx_status.stdout == "Running"
+    changed_when: false
+
+  # ---------------------------
+  # Get password
+  # ---------------------------
+  - name: Get admin password
+    shell: |
+      microk8s kubectl get secret awx-admin-password \
+      -n {{ awx_namespace }} \
+      -o jsonpath="{.data.password}" | base64 --decode
+    register: awx_password
+    changed_when: false
+
+  - name: Show access
+    debug:
+      msg:
+        - "AWX URL: http://{{ ansible_host }}:30080"
+        - "Username: admin"
+        - "Password: {{ awx_password.stdout }}"
+        - "✅ Custom CA baked into image"
+        - "✅ LDAPS will validate correctly"

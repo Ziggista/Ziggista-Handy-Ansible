@@ -1,0 +1,60 @@
+---
+- name: Disable Ubuntu Pro ESM and apt-news
+  hosts: ansible_managed_ubuntu
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Disable esm-infra
+      ansible.builtin.command: pro disable esm-infra
+      register: disable_esm_infra
+      changed_when: "'already disabled' not in disable_esm_infra.stdout | lower"
+      failed_when: false
+
+    - name: Disable esm-apps
+      ansible.builtin.command: pro disable esm-apps
+      register: disable_esm_apps
+      changed_when: "'already disabled' not in disable_esm_apps.stdout | lower"
+      failed_when: false
+
+    - name: Disable apt news in Ubuntu Pro configuration
+      ansible.builtin.command: pro config set apt_news=false
+      changed_when: false
+
+    - name: Check if ESM hook config exists
+      ansible.builtin.stat:
+        path: /etc/apt/apt.conf.d/20apt-esm-hook.conf
+      register: esm_hook
+
+    - name: Rename ESM hook config
+      ansible.builtin.command:
+        cmd: >
+          mv -v
+          /etc/apt/apt.conf.d/20apt-esm-hook.conf
+          /etc/apt/apt.conf.d/20apt-esm-hook.conf.disabled
+      when: esm_hook.stat.exists
+
+    - name: Create empty ESM hook config file
+      ansible.builtin.file:
+        path: /etc/apt/apt.conf.d/20apt-esm-hook.conf
+        state: touch
+        mode: '0644'
+
+    - name: Remove ubuntu-advantage-tools package
+      ansible.builtin.apt:
+        name: ubuntu-advantage-tools
+        state: absent
+        purge: true
+        autoremove: true
+
+    - name: Mask apt-news service
+      ansible.builtin.systemd:
+        name: apt-news.service
+        masked: true
+        enabled: false
+
+    - name: Mask esm-cache service
+      ansible.builtin.systemd:
+        name: esm-cache.service
+        masked: true
+        enabled: false

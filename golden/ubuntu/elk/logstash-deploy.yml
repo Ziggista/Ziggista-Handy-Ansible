@@ -1,0 +1,281 @@
+- name: Deploy Logstash + rsyslog (HA syslog collectors)
+  hosts: logstash
+  become: true
+  serial: 1
+
+  vars:
+
+    logstash_es_user: "logstash_ingest"
+    logstash_es_password: "jy1SpZcKVr39zF7Ytqt3cxsu71C5YUpH4brmxF9c1J7Lz"
+
+    cert_dir: /etc/cert/2026
+    ca_file: /usr/local/share/ca-certificates/rrc-ca.crt
+    logstash_cert_dir: /etc/logstash/certs
+
+    logstash_port: 5044
+    elastic_version: "8.x"
+    es_nodes:
+      - "https://P-ES-01:9200"
+      - "https://P-ES-02:9200"
+      - "https://P-ES-03:9200"
+
+    awx_logstash_port: 5140
+
+  tasks:
+
+    # -----------------------------
+    # INSTALL
+    # -----------------------------
+
+    - name: Install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Add Elastic GPG key
+      apt_key:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        state: present
+
+    - name: Add Elastic repository
+      apt_repository:
+        repo: "deb https://artifacts.elastic.co/packages/{{ elastic_version }}/apt stable main"
+        filename: elastic
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Logstash
+      apt:
+        name: logstash
+        state: present
+
+    - name: Ensure rsyslog is installed
+      apt:
+        name: rsyslog
+        state: present
+
+    - name: Enable & start rsyslog
+      service:
+        name: rsyslog
+        state: started
+        enabled: true
+
+
+    # -----------------------------
+    # CERTIFICATES
+    # -----------------------------
+
+    - name: Create Logstash cert directory
+      file:
+        path: "{{ logstash_cert_dir }}"
+        state: directory
+        owner: root
+        group: logstash
+        mode: "0750"
+
+    - name: Copy CA certificate
+      copy:
+        src: "{{ ca_file }}"
+        dest: "{{ logstash_cert_dir }}/rrc-ca.crt"
+        remote_src: true
+        owner: root
+        group: logstash
+        mode: "0644"
+
+    # - name: Enable & start logstash
+    #   service:
+    #     name: logstash
+    #     state: started
+    #     enabled: true
+
+    # -----------------------------
+    # RSYSLOG CONFIG
+    # -----------------------------
+
+
+    - name: Configure rsyslog listener
+      blockinfile:
+        path: /etc/rsyslog.d/10-listener.conf
+        create: true
+        marker: "# {mark} ANSIBLE MANAGED RSYSLOG LISTENER"
+        block: |
+          module(load="imudp")
+          input(type="imudp" port="514")
+
+          module(load="imtcp")
+          input(type="imtcp" port="514")
+      notify: restart rsyslog
+
+    - name: Configure Logstash pipelines
+      blockinfile:
+        path: /etc/logstash/pipelines.yml
+        create: true
+        marker: "# {mark} ANSIBLE MANAGED LOGSTASH PIPELINES"
+        block: |
+          - pipeline.id: syslog
+            path.config: "/etc/logstash/conf.d/01-syslog.conf"
+
+          - pipeline.id: awx
+            path.config: "/etc/logstash/conf.d/02-awx.conf"
+      notify: validate and restart logstash
+
+    - name: Configure Syslog pipeline
+      blockinfile:
+        path: /etc/logstash/conf.d/01-syslog.conf
+        create: true
+        marker: "# {mark} ANSIBLE MANAGED SYSLOG PIPELINE"
+        block: |
+          input {
+            syslog {
+              port => {{ logstash_port }}
+            }
+          }
+
+          filter {
+
+            if [host][hostname] =~ /^\d+\.\d+\.\d+\.\d+$/ {
+              if [message] =~ /%[A-Z0-9_-]+-[0-7]-/ {
+                grok {
+                  match => {
+                    "[0message" => "^(?<cisco_hostname>[A-Za-z0-9_-]+(?:-[Za-z0-9_-]+)*): %{GREEDYDATA:cisco_message}"
+                  }
+                  tag_on_failure => []
+                }
+                if [cisco_hostname] {
+                  mutate {
+                    add_field => {
+                      "[source][ip]" => "%{[host][hostname]}"
+                    }
+                    replace => {
+                      "[host][hostname]" => "%{cisco_hostname}"
+                    }
+                  }
+                }
+              }
+            }
+
+            mutate {
+              add_field => {
+                "[observer][name]" => "{{ inventory_hostname }}"
+                "[labels][environment]" => "prod"
+                "[labels][source]" => "syslog"
+              }
+            }
+
+          }
+
+          output {
+            elasticsearch {
+              hosts => {{ es_nodes | to_json }}
+
+              user => "{{ logstash_es_user }}"
+              password => "{{ logstash_es_password }}"
+
+              ssl_enabled => true
+
+              ssl_certificate_authorities => [
+                "{{ logstash_cert_dir }}/rrc-ca.crt"
+              ]
+
+              index => "logstash-%{+YYYY.MM.dd}"
+            }
+          }
+      notify: validate and restart logstash
+
+
+    # -----------------------------
+    # LOGSTASH PIPELINE
+    # -----------------------------
+
+    - name: Configure AWX pipeline
+      blockinfile:
+        path: /etc/logstash/conf.d/02-awx.conf
+        create: true
+        marker: "# {mark} ANSIBLE MANAGED AWX PIPELINE"
+        block: |
+          input {
+            tcp {
+              port => {{ awx_logstash_port }}
+              codec => json
+            }
+          }
+
+          filter {
+            mutate {
+              add_field => {
+                "[observer][name]" => "{{ inventory_hostname }}"
+                "[labels][environment]" => "prod"
+                "[labels][source]" => "awx"
+              }
+            }
+          }
+
+          output {
+            elasticsearch {
+              hosts => {{ es_nodes | to_json }}
+
+              user => "{{ logstash_es_user }}"
+              password => "{{ logstash_es_password }}"
+
+              ssl_enabled => true
+
+              ssl_certificate_authorities => [
+                "{{ logstash_cert_dir }}/rrc-ca.crt"
+              ]
+
+              index => "awx-%{+YYYY.MM.dd}"
+            }
+          }
+      notify: validate and restart logstash
+
+    - name: Configure rsyslog forward to logstash
+      blockinfile:
+        path: /etc/rsyslog.d/50-logstash.conf
+        create: true
+        marker: "# {mark} ANSIBLE MANAGED RSYSLOG FORWARDING"
+        block: |
+          if $programname == 'logstash' then stop
+
+          *.* @@127.0.0.1:{{ logstash_port }}
+
+          # Forward to taegis syslog server
+          *.* @@172.19.3.22:601
+
+          $ActionQueueType LinkedList
+          $ActionQueueFileName logstashqueue
+          $ActionQueueMaxDiskSpace 5g
+          $ActionQueueSaveOnShutdown on
+          $ActionResumeRetryCount -1
+
+          & stop
+      notify: restart rsyslog
+
+
+  # -----------------------------
+  # HANDLERS
+  # -----------------------------
+
+
+  handlers:
+
+    - name: restart rsyslog
+      service:
+        name: rsyslog
+        state: restarted
+
+    - name: validate logstash config
+      command: /usr/share/logstash/bin/logstash --path.settings /etc/logstash -t
+      changed_when: false
+      listen: validate and restart logstash
+
+    - name: restart logstash
+      service:
+        name: logstash
+        state: restarted
+      listen: validate and restart logstash

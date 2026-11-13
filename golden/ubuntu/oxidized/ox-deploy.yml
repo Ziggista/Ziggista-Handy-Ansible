@@ -1,0 +1,204 @@
+---
+- name: Install and configure Oxidized (system-wide)
+  hosts: P-OXIDIZED-01
+  become: true
+
+  vars:
+    oxidized_user: oxidized
+    oxidized_group: oxidized
+    oxidized_home: /etc/oxidized
+    oxidized_optional_web: true
+    oxidized_optional_script: true
+
+  tasks:
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Enable universe repository (Ubuntu only)
+      apt_repository:
+        repo: "deb http://archive.ubuntu.com/ubuntu {{ ansible_distribution_release }} universe"
+        state: present
+      when: ansible_facts['distribution'] == "Ubuntu"
+
+    - name: Install required packages
+      apt:
+        name:
+          - ruby
+          - ruby-dev
+          - libsqlite3-dev
+          - libssl-dev
+          - pkg-config
+          - cmake
+          - libssh2-1-dev
+          - libicu-dev
+          - zlib1g-dev
+          - g++
+          - libyaml-dev
+          - libzstd-dev
+        state: present
+
+    - name: Create oxidized group
+      group:
+        name: "{{ oxidized_group }}"
+        system: yes
+
+    - name: Create oxidized user with home directory
+      user:
+        name: "{{ oxidized_user }}"
+        group: "{{ oxidized_group }}"
+        system: yes
+        shell: /usr/sbin/nologin
+        create_home: yes
+        home: /home/{{ oxidized_user }}
+
+    - name: Ensure oxidized home directory permissions
+      file:
+        path: "/home/{{ oxidized_user }}"
+        state: directory
+        owner: "{{ oxidized_user }}"
+        group: "{{ oxidized_group }}"
+        mode: '0755'
+
+    - name: Install bundler
+      gem:
+        name: bundler
+        state: present
+        user_install: no
+
+    - name: Install Oxidized gem
+      gem:
+        name: oxidized
+        state: present
+        user_install: no
+
+    - name: Install optional gems
+      gem:
+        name: "{{ item }}"
+        state: present
+        user_install: no
+      loop:
+        - oxidized-web
+        - oxidized-script
+      when: >
+        (item == 'oxidized-web' and oxidized_optional_web) or
+        (item == 'oxidized-script' and oxidized_optional_script)
+
+    - name: Create oxidized base directory
+      file:
+        path: "{{ oxidized_home }}"
+        state: directory
+        owner: "{{ oxidized_user }}"
+        group: "{{ oxidized_group }}"
+        mode: '0755'
+
+    - name: Initialize Oxidized configuration
+      become: true
+      become_user: "{{ oxidized_user }}"
+      environment:
+        OXIDIZED_HOME: "{{ oxidized_home }}"
+      command: oxidized
+      args:
+        creates: "{{ oxidized_home }}/config"
+      vars:
+        ansible_shell_allow_world_readable_temp: true
+
+
+    # - name: Create subdirectories
+    #   file:
+    #     path: "{{ oxidized_home }}/{{ item }}"
+    #     state: directory
+    #     owner: "{{ oxidized_user }}"
+    #     group: "{{ oxidized_group }}"
+    #     mode: '0755'
+    #   loop:
+    #     - repository.git
+    #     - log-router-ssh
+    #     - log-router-telnet
+
+    # - name: Create required files
+    #   file:
+    #     path: "{{ oxidized_home }}/{{ item }}"
+    #     state: touch
+    #     owner: "{{ oxidized_user }}"
+    #     group: "{{ oxidized_group }}"
+    #     mode: '0644'
+    #   loop:
+    #     - router.db
+    #     - pid
+
+    # - name: Deploy Oxidized config
+    #   copy:
+    #     dest: "{{ oxidized_home }}/config"
+    #     owner: "{{ oxidized_user }}"
+    #     group: "{{ oxidized_group }}"
+    #     mode: '0644'
+    #     content: |
+    #       ---
+    #       username: admin
+    #       password: admin
+    #       model: ios
+    #       interval: 3600
+    #       use_syslog: false
+    #       debug: false
+    #       threads: 5
+    #       timeout: 20
+    #       retries: 3
+    #       pid: "{{ oxidized_home }}/pid"
+
+    #       input:
+    #         default: ssh
+
+    #       output:
+    #         default: git
+    #         git:
+    #           repo: "{{ oxidized_home }}/repository.git"
+
+    #       source:
+    #         default: csv
+    #         csv:
+    #           file: "{{ oxidized_home }}/router.db"
+    #           delimiter: !ruby/regexp /:/
+    #           map:
+    #             name: 0
+    #             model: 1
+    #             group: 2
+
+    - name: Verify oxidized installation
+      command: oxidized --version
+      register: oxidized_version
+      changed_when: false
+
+    - debug:
+        var: oxidized_version.stdout
+
+    - name: Create systemd service
+      copy:
+        dest: /etc/systemd/system/oxidized.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Oxidized Network Device Configuration Backup Tool
+          After=network.target
+
+          [Service]
+          Environment=OXIDIZED_HOME={{ oxidized_home }}
+          ExecStart=/usr/local/bin/oxidized
+          User={{ oxidized_user }}
+          Group={{ oxidized_group }}
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      command: systemctl daemon-reload
+
+    - name: Enable and start oxidized
+      systemd:
+        name: oxidized
+        enabled: yes
+        state: started

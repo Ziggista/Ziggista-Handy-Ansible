@@ -1,0 +1,515 @@
+---
+- name: Deploy AWX on MicroK8s with HTTPS and LDAPS SECLEVEL workaround
+  hosts: P-AWX-01
+  become: true
+
+  vars:
+    # ---------------------------
+    # AWX / Kubernetes
+    # ---------------------------
+    awx_namespace: awx
+    awx_name: awx
+    awx_hostname: awx.rrc.local
+
+    awx_operator_version: "2.15.0"
+    awx_base_image: quay.io/ansible/awx:24.2.0
+    awx_custom_image: awx-custom-ca:24.2.0
+
+    # ---------------------------
+    # Paths
+    # ---------------------------
+    awx_dir: /opt/awx
+    tls_dir: /opt/awx/tls
+    openssl_config_path: /opt/awx/openssl_awx.cnf
+
+    # ---------------------------
+    # CertSrv CA
+    # This is your internal CA used to validate LDAPS.
+    # This file must exist on the Ansible controller unless you change copy mode.
+    # ---------------------------
+    ca_cert_src: /home/dixk/ansible-lab/CertSrv-2036-4096.cer
+    ca_cert_dest: rrc-ca.crt
+
+    # ---------------------------
+    # Optional LDAPS validation
+    # Set this to your DC / LDAP server FQDN if you want the playbook to test LDAPS.
+    # It should match the certificate SAN/CN where possible.
+    # ---------------------------
+    ldaps_host: ""
+    ldaps_port: 636
+
+  tasks:
+
+    # ============================================================
+    # 1. Host prerequisites
+    # ============================================================
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - openssl
+        state: present
+        update_cache: true
+
+    - name: Ensure Docker is running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Enable MicroK8s ingress
+      ansible.builtin.command: microk8s enable ingress
+      changed_when: false
+
+    - name: Ensure AWX working directory exists
+      ansible.builtin.file:
+        path: "{{ awx_dir }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+
+    - name: Ensure TLS directory exists
+      ansible.builtin.file:
+        path: "{{ tls_dir }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0755"
+
+    # ============================================================
+    # 2. Namespace
+    # ============================================================
+
+    - name: Ensure AWX namespace exists
+      ansible.builtin.command: >
+        microk8s kubectl create namespace {{ awx_namespace }}
+      register: namespace_create
+      failed_when:
+        - namespace_create.rc != 0
+        - "'AlreadyExists' not in namespace_create.stderr"
+      changed_when: "'created' in namespace_create.stdout"
+
+    # ============================================================
+    # 3. Build AWX custom image with internal CertSrv CA
+    # ============================================================
+
+    - name: Copy internal CertSrv CA to AWX TLS directory
+      ansible.builtin.copy:
+        src: "{{ ca_cert_src }}"
+        dest: "{{ tls_dir }}/{{ ca_cert_dest }}"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0644"
+
+    - name: Copy internal CertSrv CA into Docker build context
+      ansible.builtin.copy:
+        src: "{{ tls_dir }}/{{ ca_cert_dest }}"
+        dest: "{{ awx_dir }}/{{ ca_cert_dest }}"
+        remote_src: true
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0644"
+
+    - name: Create AWX custom image Dockerfile
+      ansible.builtin.copy:
+        dest: "{{ awx_dir }}/Dockerfile"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0644"
+        content: |
+          FROM {{ awx_base_image }}
+
+          USER root
+
+          COPY {{ ca_cert_dest }} /etc/pki/ca-trust/source/anchors/{{ ca_cert_dest }}
+          RUN update-ca-trust
+
+          USER 1000
+
+    - name: Build AWX custom CA image
+      ansible.builtin.command: >
+        docker build -t {{ awx_custom_image }} {{ awx_dir }}
+      register: docker_build
+      changed_when: "'Successfully tagged' in docker_build.stdout or 'writing image' in docker_build.stdout"
+
+    - name: Save AWX custom image to tar
+      ansible.builtin.command: >
+        docker save {{ awx_custom_image }} -o {{ awx_dir }}/awx-custom.tar
+      changed_when: true
+
+    - name: Import AWX custom image into MicroK8s containerd
+      ansible.builtin.command: >
+        microk8s ctr image import {{ awx_dir }}/awx-custom.tar
+      register: ctr_import
+      changed_when: true
+
+    - name: Confirm custom image exists in MicroK8s containerd
+      ansible.builtin.shell: |
+        microk8s ctr images list | grep -F "{{ awx_custom_image }}"
+      register: ctr_image_check
+      changed_when: false
+
+    - name: Show imported AWX custom image
+      ansible.builtin.debug:
+        var: ctr_image_check.stdout_lines
+
+    # ============================================================
+    # 4. Deploy AWX Operator
+    #    Avoid remote kustomize GitHub fetch because MicroK8s snap
+    #    can break git-remote-https/libcurl on Ubuntu.
+    # ============================================================
+
+    - name: Install git
+      ansible.builtin.apt:
+        name: git
+        state: present
+        update_cache: true
+
+    - name: Remove old local AWX Operator checkout if version changed
+      ansible.builtin.file:
+        path: "{{ awx_dir }}/awx-operator"
+        state: absent
+
+    - name: Clone AWX Operator locally
+      ansible.builtin.git:
+        repo: https://github.com/ansible/awx-operator.git
+        dest: "{{ awx_dir }}/awx-operator"
+        version: "{{ awx_operator_version }}"
+        depth: 1
+        force: true
+
+    - name: Create AWX Operator kustomization using local checkout
+      ansible.builtin.copy:
+        dest: "{{ awx_dir }}/kustomization.yaml"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0644"
+        content: |
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+
+          resources:
+            - ./awx-operator/config/default
+
+          namespace: {{ awx_namespace }}
+
+          images:
+            - name: quay.io/ansible/awx-operator
+              newTag: {{ awx_operator_version }}
+
+            - name: gcr.io/kubebuilder/kube-rbac-proxy
+              newName: docker.io/kubebuilder/kube-rbac-proxy
+              newTag: v0.15.0
+
+    - name: Render AWX Operator manifests from local checkout
+      ansible.builtin.command: >
+        microk8s kubectl kustomize {{ awx_dir }}
+      register: operator_yaml
+      changed_when: false
+
+    - name: Apply AWX Operator manifests
+      ansible.builtin.command: microk8s kubectl apply -f -
+      args:
+        stdin: "{{ operator_yaml.stdout }}"
+      changed_when: true
+
+    - name: Wait for AWX Operator controller manager to be ready
+      ansible.builtin.shell: |
+        microk8s kubectl get pods -n {{ awx_namespace }} \
+          -l control-plane=controller-manager \
+          -o jsonpath="{.items[0].status.containerStatuses[0].ready}"
+      register: operator_ready
+      retries: 30
+      delay: 10
+      until: operator_ready.stdout == "true"
+      changed_when: false
+
+    # ============================================================
+    # 5. HTTPS certificate for AWX ingress
+    # ============================================================
+
+    - name: Check if AWX HTTPS private key exists
+      ansible.builtin.stat:
+        path: "{{ tls_dir }}/awx.key"
+      register: awx_key_stat
+
+    - name: Check if AWX HTTPS certificate exists
+      ansible.builtin.stat:
+        path: "{{ tls_dir }}/awx.crt"
+      register: awx_crt_stat
+
+    - name: Generate AWX HTTPS private key
+      ansible.builtin.command: >
+        openssl genrsa -out {{ tls_dir }}/awx.key 2048
+      when: not awx_key_stat.stat.exists
+
+    - name: Create AWX HTTPS OpenSSL CSR config with SAN
+      ansible.builtin.copy:
+        dest: "{{ tls_dir }}/awx_https.cnf"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0644"
+        content: |
+          [ req ]
+          default_bits       = 2048
+          prompt             = no
+          default_md         = sha256
+          distinguished_name = dn
+          x509_extensions    = v3_req
+
+          [ dn ]
+          CN = {{ awx_hostname }}
+
+          [ v3_req ]
+          subjectAltName = @alt_names
+
+          [ alt_names ]
+          DNS.1 = {{ awx_hostname }}
+
+    - name: Generate AWX HTTPS self-signed certificate with SAN
+      ansible.builtin.command: >
+        openssl req -x509 -nodes -days 365
+        -key {{ tls_dir }}/awx.key
+        -out {{ tls_dir }}/awx.crt
+        -config {{ tls_dir }}/awx_https.cnf
+      when: not awx_crt_stat.stat.exists
+
+    - name: Apply AWX HTTPS TLS secret
+      ansible.builtin.shell: |
+        microk8s kubectl create secret tls awx-tls \
+          --key {{ tls_dir }}/awx.key \
+          --cert {{ tls_dir }}/awx.crt \
+          -n {{ awx_namespace }} \
+          --dry-run=client -o yaml | microk8s kubectl apply -f -
+      changed_when: true
+
+    # ============================================================
+    # 6. OpenSSL LDAPS legacy SECLEVEL workaround
+    # ============================================================
+
+    - name: Create OpenSSL legacy override config for AWX LDAPS
+      ansible.builtin.copy:
+        dest: "{{ openssl_config_path }}"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0644"
+        content: |
+          openssl_conf = default_conf
+
+          [ default_conf ]
+          ssl_conf = ssl_sect
+
+          [ ssl_sect ]
+          system_default = ssl_default_sect
+
+          [ ssl_default_sect ]
+          MinProtocol = TLSv1.2
+          CipherString = DEFAULT:@SECLEVEL=1
+
+    - name: Apply OpenSSL legacy ConfigMap
+      ansible.builtin.shell: |
+        microk8s kubectl create configmap openssl-legacy \
+          --from-file=openssl.cnf={{ openssl_config_path }} \
+          -n {{ awx_namespace }} \
+          --dry-run=client -o yaml | microk8s kubectl apply -f -
+      changed_when: true
+
+    # ============================================================
+    # 7. Deploy AWX instance with custom image, HTTPS and LDAPS workaround
+    # ============================================================
+
+    - name: Create AWX custom resource
+      ansible.builtin.copy:
+        dest: "{{ awx_dir }}/awx.yaml"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0644"
+        content: |
+          apiVersion: awx.ansible.com/v1beta1
+          kind: AWX
+          metadata:
+            name: {{ awx_name }}
+            namespace: {{ awx_namespace }}
+
+          spec:
+            service_type: ClusterIP
+
+            ingress_type: ingress
+            hostname: {{ awx_hostname }}
+            ingress_tls_secret: awx-tls
+
+            image: "{{ awx_custom_image.split(':')[0] }}"
+            image_version: "{{ awx_custom_image.split(':')[1] }}"
+            image_pull_policy: IfNotPresent
+
+            web_extra_env: |
+              - name: OPENSSL_CONF
+                value: /etc/awx/openssl.cnf
+
+            task_extra_env: |
+              - name: OPENSSL_CONF
+                value: /etc/awx/openssl.cnf
+
+            extra_volumes: |
+              - name: openssl-conf
+                configMap:
+                  name: openssl-legacy
+
+            web_extra_volume_mounts: |
+              - name: openssl-conf
+                mountPath: /etc/awx/openssl.cnf
+                subPath: openssl.cnf
+                readOnly: true
+
+            task_extra_volume_mounts: |
+              - name: openssl-conf
+                mountPath: /etc/awx/openssl.cnf
+                subPath: openssl.cnf
+                readOnly: true
+
+            projects_persistence: true
+            projects_storage_size: 5Gi
+            postgres_storage_class: microk8s-hostpath
+
+    - name: Apply AWX custom resource
+      ansible.builtin.command: >
+        microk8s kubectl apply -f {{ awx_dir }}/awx.yaml
+      changed_when: true
+
+    # ============================================================
+    # 8. Restart AWX pods after spec/configmap/image changes
+    # ============================================================
+
+    - name: Delete AWX application pods so operator recreates them with latest spec
+      ansible.builtin.shell: |
+        microk8s kubectl delete pod -n {{ awx_namespace }} \
+          -l app.kubernetes.io/part-of={{ awx_name }} \
+          --ignore-not-found=true
+      changed_when: true
+
+    - name: Wait for AWX web deployment rollout
+      ansible.builtin.command: >
+        microk8s kubectl rollout status deployment/{{ awx_name }}-web
+        -n {{ awx_namespace }}
+        --timeout=600s
+      register: web_rollout
+      retries: 3
+      delay: 20
+      until: web_rollout.rc == 0
+      changed_when: false
+
+    - name: Wait for AWX task deployment rollout
+      ansible.builtin.command: >
+        microk8s kubectl rollout status deployment/{{ awx_name }}-task
+        -n {{ awx_namespace }}
+        --timeout=600s
+      register: task_rollout
+      retries: 3
+      delay: 20
+      until: task_rollout.rc == 0
+      changed_when: false
+
+    # ============================================================
+    # 9. Validation
+    # ============================================================
+
+    - name: Show running AWX pod images
+      ansible.builtin.shell: |
+        microk8s kubectl get pods -n {{ awx_namespace }} \
+          -o jsonpath='{range .items[*]}{.metadata.name}{" => "}{range .spec.containers[*]}{.image}{" "}{end}{"\n"}{end}'
+      register: awx_running_images
+      changed_when: false
+
+    - name: Display running AWX images
+      ansible.builtin.debug:
+        var: awx_running_images.stdout_lines
+
+    - name: Verify OPENSSL_CONF in awx-web
+      ansible.builtin.shell: |
+        microk8s kubectl exec deployment/{{ awx_name }}-web -n {{ awx_namespace }} -- \
+          sh -c 'env | grep OPENSSL_CONF && test -f /etc/awx/openssl.cnf && cat /etc/awx/openssl.cnf'
+      register: web_openssl_check
+      changed_when: false
+
+    - name: Display awx-web OpenSSL config check
+      ansible.builtin.debug:
+        var: web_openssl_check.stdout_lines
+
+    - name: Verify OPENSSL_CONF in awx-task
+      ansible.builtin.shell: |
+        microk8s kubectl exec deployment/{{ awx_name }}-task -n {{ awx_namespace }} -- \
+          sh -c 'env | grep OPENSSL_CONF && test -f /etc/awx/openssl.cnf && cat /etc/awx/openssl.cnf'
+      register: task_openssl_check
+      changed_when: false
+
+    - name: Display awx-task OpenSSL config check
+      ansible.builtin.debug:
+        var: task_openssl_check.stdout_lines
+
+    - name: Verify internal CertSrv CA is present in awx-web trust anchors
+      ansible.builtin.shell: |
+        microk8s kubectl exec deployment/{{ awx_name }}-web -n {{ awx_namespace }} -- \
+          sh -c 'ls -l /etc/pki/ca-trust/source/anchors/ && test -f /etc/pki/ca-trust/source/anchors/{{ ca_cert_dest }}'
+      register: web_ca_check
+      changed_when: false
+
+    - name: Display awx-web CA anchor check
+      ansible.builtin.debug:
+        var: web_ca_check.stdout_lines
+
+    - name: Verify Python/OpenSSL view from awx-web
+      ansible.builtin.shell: |
+        microk8s kubectl exec deployment/{{ awx_name }}-web -n {{ awx_namespace }} -- \
+          python3 - <<'PY'
+        import os, ssl
+        print("OPENSSL_CONF =", os.environ.get("OPENSSL_CONF"))
+        print("OpenSSL version =", ssl.OPENSSL_VERSION)
+        print("Default verify paths =", ssl.get_default_verify_paths())
+        ctx = ssl.create_default_context()
+        print("Python SSL context created OK")
+        PY
+      register: web_python_ssl_check
+      changed_when: false
+
+    - name: Display Python/OpenSSL check
+      ansible.builtin.debug:
+        var: web_python_ssl_check.stdout_lines
+
+    - name: Optional LDAPS test from awx-web using OpenSSL config
+      ansible.builtin.shell: |
+        microk8s kubectl exec deployment/{{ awx_name }}-web -n {{ awx_namespace }} -- \
+          sh -c 'OPENSSL_CONF=/etc/awx/openssl.cnf openssl s_client \
+          -connect {{ ldaps_host }}:{{ ldaps_port }} \
+          -servername {{ ldaps_host }} \
+          -CAfile /etc/pki/tls/certs/ca-bundle.crt </dev/null'
+      register: ldaps_openssl_test
+      changed_when: false
+      failed_when: false
+      when: ldaps_host | length > 0
+
+    - name: Display optional LDAPS OpenSSL test
+      ansible.builtin.debug:
+        var: ldaps_openssl_test.stdout_lines
+      when: ldaps_host | length > 0
+
+    - name: Get AWX admin password
+      ansible.builtin.shell: |
+        microk8s kubectl get secret {{ awx_name }}-admin-password \
+          -n {{ awx_namespace }} \
+          -o jsonpath="{.data.password}" | base64 --decode
+      register: awx_password
+      changed_when: false
+      failed_when: false
+
+    - name: Final result
+      ansible.builtin.debug:
+        msg:
+          - "AWX URL: https://{{ awx_hostname }}"
+          - "Username: admin"
+          - "Password: {{ awx_password.stdout | default('Could not read password secret') }}"
+          - "Custom CA image requested: {{ awx_custom_image }}"
+          - "OpenSSL config mounted at: /etc/awx/openssl.cnf"
+          - "LDAPS SECLEVEL workaround: DEFAULT:@SECLEVEL=1"
+          - "Check the validation output above before assuming LDAPS is fixed."

@@ -1,0 +1,7 @@
+---
+- name: Configure FreeRADIUS
+  hosts: radius
+  become: true
+
+  roles:
+    - freeradius

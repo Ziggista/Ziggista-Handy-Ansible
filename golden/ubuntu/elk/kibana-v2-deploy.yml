@@ -1,0 +1,166 @@
+---
+- name: Deploy Kibana v2 (TLS Enabled)
+  hosts: P-KIBANA-01
+  become: true
+
+  vars:
+    elastic_version: "8.x"
+
+    cert_dir: "/etc/cert/2026"
+    kibana_cert_dir: "/etc/kibana/certs"
+
+    es_hosts:
+      - "https://P-ES-01:9200"
+      - "https://P-ES-02:9200"
+      - "https://P-ES-03:9200"
+
+    kibana_system_password: "O8M*qKwjfi84vgrYe-qn"
+
+  tasks:
+
+    # -----------------------------
+    # INSTALL
+    # -----------------------------
+    - name: Install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - curl
+        state: present
+        update_cache: true
+
+    - name: Add Elastic GPG key
+      apt_key:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        state: present
+
+    - name: Add Elastic repository
+      apt_repository:
+        repo: "deb https://artifacts.elastic.co/packages/{{ elastic_version }}/apt stable main"
+        filename: elastic
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: true
+
+    - name: Install Kibana
+      apt:
+        name: kibana
+        state: present
+
+    # -----------------------------
+    # CERTIFICATES
+    # -----------------------------
+    - name: Create Kibana cert directory
+      file:
+        path: "{{ kibana_cert_dir }}"
+        state: directory
+        owner: root
+        group: kibana
+        mode: "0750"
+
+    - name: Copy Kibana certificate
+      copy:
+        src: "{{ cert_dir }}/{{ inventory_hostname }}.cer"
+        dest: "{{ kibana_cert_dir }}/{{ inventory_hostname }}.cer"
+        remote_src: true
+        owner: root
+        group: kibana
+        mode: "0640"
+
+    - name: Copy Kibana private key
+      copy:
+        src: "{{ cert_dir }}/{{ inventory_hostname }}.key"
+        dest: "{{ kibana_cert_dir }}/{{ inventory_hostname }}.key"
+        remote_src: true
+        owner: root
+        group: kibana
+        mode: "0640"
+
+    - name: Copy trusted CA
+      copy:
+        src: /usr/local/share/ca-certificates/rrc-ca.crt
+        dest: "{{ kibana_cert_dir }}/rrc-ca.crt"
+        remote_src: true
+        owner: root
+        group: kibana
+        mode: "0644"
+
+    # -----------------------------
+    # LOG DIRECTORY
+    # -----------------------------
+    - name: Ensure Kibana log directory exists
+      file:
+        path: /var/log/kibana
+        state: directory
+        owner: kibana
+        group: kibana
+        mode: "0755"
+
+    # -----------------------------
+    # CONFIGURE KIBANA
+    # -----------------------------
+    - name: Configure kibana.yml
+      copy:
+        dest: /etc/kibana/kibana.yml
+        owner: root
+        group: kibana
+        mode: "0640"
+        content: |
+          server.port: 5601
+          server.host: "0.0.0.0"
+
+          server.name: "{{ inventory_hostname }}"
+
+          server.publicBaseUrl: "https://p-kibana-01.rrc.local"
+
+          server.ssl.enabled: true
+          server.ssl.certificate: {{ kibana_cert_dir }}/{{ inventory_hostname }}.cer
+          server.ssl.key: {{ kibana_cert_dir }}/{{ inventory_hostname }}.key
+
+          elasticsearch.hosts:
+          {% for host in es_hosts %}
+            - "{{ host }}"
+          {% endfor %}
+
+          elasticsearch.username: "kibana_system"
+          elasticsearch.password: "{{ kibana_system_password }}"
+
+          elasticsearch.ssl.certificateAuthorities:
+            - "{{ kibana_cert_dir }}/rrc-ca.crt"
+
+          monitoring.ui.container.elasticsearch.enabled: true
+
+          logging:
+            appenders:
+              file:
+                type: file
+                fileName: /var/log/kibana/kibana.log
+                layout:
+                  type: json
+
+            root:
+              appenders:
+                - file
+              level: info
+      notify: restart kibana
+
+    # -----------------------------
+    # ENABLE + START
+    # -----------------------------
+    - name: Enable Kibana
+      service:
+        name: kibana
+        enabled: true
+
+    - name: Start Kibana
+      service:
+        name: kibana
+        state: started
+
+  handlers:
+    - name: restart kibana
+      service:
+        name: kibana
+        state: restarted

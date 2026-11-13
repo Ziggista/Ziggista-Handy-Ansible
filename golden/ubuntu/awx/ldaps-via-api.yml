@@ -1,0 +1,176 @@
+---
+- name: Configure AWX LDAPS settings via AWX API
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    # AWX API
+    awx_url: "https://awx.rrc.local"
+    awx_admin_user: "admin"
+    awx_validate_certs: false
+    awx_ldap_settings_endpoint: "{{ awx_url }}/api/v2/settings/ldap/"
+
+    # AD / LDAPS
+    ldap_server_uri: "ldaps://P-DC-01.RRC.LOCAL:636 ldaps://P-DC-02.RRC.LOCAL:636 ldaps://P-DC-03.RRC.LOCAL:636 ldaps://P-DC-04.RRC.LOCAL:636"
+
+    ldap_bind_dn: "CN=svc_AWX-ldaps,OU=Services,OU=IT Administration,OU=RRC,DC=RRC,DC=LOCAL"
+    ldap_user_search_base: "DC=RRC,DC=LOCAL"
+    ldap_group_search_base: "DC=RRC,DC=LOCAL"
+
+    ldap_require_group: "CN=IT_AWX_Users,OU=Groups,OU=IT Administration,OU=RRC,DC=RRC,DC=LOCAL"
+    ldap_superuser_group: "CN=IT_AWX_SuperUsers,OU=Groups,OU=IT Administration,OU=RRC,DC=RRC,DC=LOCAL"
+    ldap_auditor_group: ""
+
+  vars_prompt:
+    - name: awx_admin_password
+      prompt: "Enter AWX admin password"
+      private: true
+
+    - name: ldap_bind_password
+      prompt: "Enter LDAP bind account password"
+      private: true
+
+  tasks:
+
+    - name: Confirm AWX API is reachable
+      ansible.builtin.uri:
+        url: "{{ awx_url }}/api/v2/ping/"
+        method: GET
+        user: "{{ awx_admin_user }}"
+        password: "{{ awx_admin_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ awx_validate_certs }}"
+        status_code: 200
+        return_content: true
+      register: awx_ping
+      changed_when: false
+      no_log: true
+
+    - name: Show AWX API status
+      ansible.builtin.debug:
+        msg: "AWX API is reachable at {{ awx_url }}"
+
+    - name: Ensure local AWX backup directory exists
+      ansible.builtin.file:
+        path: "{{ lookup('env', 'HOME') }}/ansible-lab/backups/awx"
+        state: directory
+        mode: "0700"
+
+    - name: Read current AWX LDAP settings
+      ansible.builtin.uri:
+        url: "{{ awx_ldap_settings_endpoint }}"
+        method: GET
+        user: "{{ awx_admin_user }}"
+        password: "{{ awx_admin_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ awx_validate_certs }}"
+        status_code: 200
+        return_content: true
+      register: awx_ldap_before
+      changed_when: false
+      no_log: true
+
+    - name: Save current LDAP settings backup locally
+      ansible.builtin.copy:
+        dest: "{{ lookup('env', 'HOME') }}/ansible-lab/backups/awx/awx_ldap_settings_before.json"
+        content: "{{ awx_ldap_before.json | to_nice_json }}"
+        mode: "0600"
+      no_log: true
+    - name: Build AWX LDAP settings payload
+      ansible.builtin.set_fact:
+        awx_ldap_payload:
+          AUTH_LDAP_SERVER_URI: "{{ ldap_server_uri }}"
+
+          AUTH_LDAP_BIND_DN: "{{ ldap_bind_dn }}"
+          AUTH_LDAP_BIND_PASSWORD: "{{ ldap_bind_password }}"
+
+          # This is LDAPS, not LDAP + StartTLS.
+          AUTH_LDAP_START_TLS: false
+
+          AUTH_LDAP_CONNECTION_OPTIONS: {}
+
+          # Log in using normal AD username, e.g. dixk_a
+          AUTH_LDAP_USER_SEARCH:
+            - "{{ ldap_user_search_base }}"
+            - "SCOPE_SUBTREE"
+            - "(sAMAccountName=%(user)s)"
+
+          AUTH_LDAP_GROUP_SEARCH:
+            - "{{ ldap_group_search_base }}"
+            - "SCOPE_SUBTREE"
+            - "(objectClass=group)"
+
+          AUTH_LDAP_GROUP_TYPE: "ActiveDirectoryGroupType"
+
+          # AWX accepts name_attr here, but not member_attr.
+          # Do not add member_attr: member, it causes:
+          # Invalid key(s): "member_attr".
+          AUTH_LDAP_GROUP_TYPE_PARAMS:
+            name_attr: "cn"
+
+          # Only members of IT_AWX_Users can log in.
+          AUTH_LDAP_REQUIRE_GROUP: "{{ ldap_require_group }}"
+          AUTH_LDAP_DENY_GROUP: ""
+
+          AUTH_LDAP_USER_ATTR_MAP:
+            first_name: "givenName"
+            last_name: "sn"
+            email: "mail"
+
+          AUTH_LDAP_USER_FLAGS_BY_GROUP:
+            is_superuser:
+              - "{{ ldap_superuser_group }}"
+
+          AUTH_LDAP_ORGANIZATION_MAP: {}
+          AUTH_LDAP_TEAM_MAP: {}
+      no_log: true
+
+    - name: Apply AWX LDAP settings via API
+      ansible.builtin.uri:
+        url: "{{ awx_ldap_settings_endpoint }}"
+        method: PATCH
+        user: "{{ awx_admin_user }}"
+        password: "{{ awx_admin_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ awx_validate_certs }}"
+        status_code: 200
+        body_format: json
+        body: "{{ awx_ldap_payload }}"
+        return_content: true
+      register: awx_ldap_patch
+      no_log: true
+
+    - name: LDAP settings applied
+      ansible.builtin.debug:
+        msg:
+          - "AWX LDAP settings applied."
+          - "LDAP servers: {{ ldap_server_uri }}"
+          - "Bind DN: {{ ldap_bind_dn }}"
+          - "Required group: {{ ldap_require_group }}"
+          - "Superuser group: {{ ldap_superuser_group }}"
+          - "Previous LDAP settings backed up locally to ~/ansible-lab/backups/awx/awx_ldap_settings_before.json"
+
+    - name: Read back AWX LDAP settings
+      ansible.builtin.uri:
+        url: "{{ awx_ldap_settings_endpoint }}"
+        method: GET
+        user: "{{ awx_admin_user }}"
+        password: "{{ awx_admin_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ awx_validate_certs }}"
+        status_code: 200
+        return_content: true
+      register: awx_ldap_after
+      changed_when: false
+      no_log: true
+
+    - name: Show safe LDAP read-back summary
+      ansible.builtin.debug:
+        msg:
+          - "AUTH_LDAP_SERVER_URI: {{ awx_ldap_after.json.AUTH_LDAP_SERVER_URI | default('not returned') }}"
+          - "AUTH_LDAP_BIND_DN: {{ awx_ldap_after.json.AUTH_LDAP_BIND_DN | default('not returned') }}"
+          - "AUTH_LDAP_USER_SEARCH: {{ awx_ldap_after.json.AUTH_LDAP_USER_SEARCH | default('not returned') }}"
+          - "AUTH_LDAP_GROUP_SEARCH: {{ awx_ldap_after.json.AUTH_LDAP_GROUP_SEARCH | default('not returned') }}"
+          - "AUTH_LDAP_GROUP_TYPE: {{ awx_ldap_after.json.AUTH_LDAP_GROUP_TYPE | default('not returned') }}"
+          - "AUTH_LDAP_REQUIRE_GROUP: {{ awx_ldap_after.json.AUTH_LDAP_REQUIRE_GROUP | default('not returned') }}"
+          - "AUTH_LDAP_USER_FLAGS_BY_GROUP: {{ awx_ldap_after.json.AUTH_LDAP_USER_FLAGS_BY_GROUP | default('not returned') }}"

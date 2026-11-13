@@ -1,0 +1,189 @@
+---
+- name: Deploy Elasticsearch Cluster v2 (TLS Enabled)
+  hosts: elasticsearch
+  become: true
+
+  vars:
+    elastic_version: "8.x"
+    cluster_name: "elk-cluster"
+    
+    cert_dir: "/etc/cert/2026"
+    es_cert_dir: "/etc/elasticsearch/certs"
+
+    # ca_cert: "/usr/local/share/ca-certificates/rrc-ca.crt"
+    ca_cert: "{{ es_cert_dir }}/rrc-ca.crt"
+
+    es_nodes:
+      - P-ES-01
+      - P-ES-02
+      - P-ES-03
+
+  tasks:
+
+    # -----------------------------
+    # Install prerequisites
+    # -----------------------------
+    - name: Install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Add Elastic GPG key
+      apt_key:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        state: present
+
+    - name: Add Elastic repository
+      apt_repository:
+        repo: "deb https://artifacts.elastic.co/packages/{{ elastic_version }}/apt stable main"
+        filename: elastic
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    # -----------------------------
+    # Install Elasticsearch
+    # -----------------------------
+    - name: Install Elasticsearch
+      apt:
+        name: elasticsearch
+        state: present
+
+    - name: Ensure Elasticsearch directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: "0755"
+      loop:
+        - /var/lib/elasticsearch
+        - /var/log/elasticsearch
+
+    # -----------------------------
+    # Elasticsearch Certificate Directory
+    # -----------------------------
+    - name: Create Elasticsearch cert directory
+      file:
+        path: "{{ es_cert_dir }}"
+        state: directory
+        owner: root
+        group: elasticsearch
+        mode: "0750"
+
+    - name: Copy node certificate
+      copy:
+        src: "{{ cert_dir }}/{{ inventory_hostname }}.cer"
+        dest: "{{ es_cert_dir }}/{{ inventory_hostname }}.cer"
+        remote_src: true
+        owner: root
+        group: elasticsearch
+        mode: "0640"
+
+    - name: Copy node private key
+      copy:
+        src: "{{ cert_dir }}/{{ inventory_hostname }}.key"
+        dest: "{{ es_cert_dir }}/{{ inventory_hostname }}.key"
+        remote_src: true
+        owner: root
+        group: elasticsearch
+        mode: "0640"
+
+
+    - name: Copy CA certificate
+      copy:
+        src: /usr/local/share/ca-certificates/rrc-ca.crt
+        dest: "{{ es_cert_dir }}/rrc-ca.crt"
+        remote_src: true
+        owner: root
+        group: elasticsearch
+        mode: "0644"
+
+
+    # -----------------------------
+    # Hostname Fix
+    # -----------------------------
+    - name: Remove loopback hostname mapping
+      lineinfile:
+        path: /etc/cloud/templates/hosts.debian.tmpl
+        regexp: '^127\.0\.1\.1'
+        state: absent
+
+    - name: Regenerate /etc/hosts
+      command: cloud-init single --name update_etc_hosts
+      changed_when: false
+
+    # -----------------------------
+    # Configure Elasticsearch
+    # -----------------------------
+    - name: Configure elasticsearch.yml
+      copy:
+        dest: /etc/elasticsearch/elasticsearch.yml
+        owner: root
+        group: elasticsearch
+        mode: "0660"
+        content: |
+          cluster.name: {{ cluster_name }}
+          node.name: {{ inventory_hostname }}
+
+          network.host: "{{ ansible_default_ipv4.address }}"
+          http.port: 9200
+
+          path.data: /var/lib/elasticsearch
+          path.logs: /var/log/elasticsearch
+
+          discovery.seed_hosts:
+          {% for host in es_nodes %}
+            - "{{ host }}"
+          {% endfor %}
+
+          node.roles: [ master, data, ingest ]
+
+          xpack.security.enabled: true
+
+          xpack.security.transport.ssl.enabled: true
+          xpack.security.transport.ssl.verification_mode: certificate
+
+          xpack.security.transport.ssl.key: {{ es_cert_dir }}/{{ inventory_hostname }}.key
+          xpack.security.transport.ssl.certificate: {{ es_cert_dir }}/{{ inventory_hostname }}.cer
+          xpack.security.transport.ssl.certificate_authorities:
+            - {{ ca_cert }}
+
+          xpack.security.http.ssl.enabled: true
+          xpack.security.http.ssl.key: {{ es_cert_dir }}/{{ inventory_hostname }}.key
+          xpack.security.http.ssl.certificate: {{ es_cert_dir }}/{{ inventory_hostname }}.cer
+          xpack.security.http.ssl.certificate_authorities:
+            - {{ ca_cert }}
+
+      notify:
+        - reload systemd
+        - restart elasticsearch
+
+    # -----------------------------
+    # Enable Service
+    # -----------------------------
+    - name: Enable Elasticsearch
+      service:
+        name: elasticsearch
+        enabled: true
+
+    - name: Start Elasticsearch
+      service:
+        name: elasticsearch
+        state: started
+
+  handlers:
+
+    - name: reload systemd
+      systemd:
+        daemon_reload: true
+
+    - name: restart elasticsearch
+      service:
+        name: elasticsearch
+        state: restarted

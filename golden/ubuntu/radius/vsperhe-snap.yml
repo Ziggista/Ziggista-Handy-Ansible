@@ -1,0 +1,62 @@
+
+---
+- name: Ensure snapshot exists for VM
+  hosts: vsphere
+  gather_facts: no
+
+
+  vars_prompt:
+    - name: target_vm
+      prompt: "Enter VM name"
+      private: no
+
+  vars:
+    #target_vm: "P-UISP-01"
+    snapshot_name: "dixk_a-ansible-snapshot-{{ lookup('pipe','date +%Y%m%d') }}"
+
+  environment:
+    VMWARE_HOST: "{{ vcenter_hostname }}"
+    VMWARE_USER: "{{ vcenter_username }}"
+    VMWARE_PASSWORD: "{{ vcenter_password }}"
+    VMWARE_VALIDATE_CERTS: "true"
+
+  tasks:
+    - name: Get specific VM info
+      community.vmware.vmware_vm_info:
+        vm_name: "{{ target_vm }}"
+      register: vm_info
+    
+    - name: Set VM fact
+      ansible.builtin.set_fact:
+        vm: "{{ vm_info.virtual_machines[0] }}"
+
+    - name: Get snapshot info
+      community.vmware.vmware_guest_snapshot_info:
+        name: "{{ vm.guest_name }}"
+        datacenter: "{{ vm.datacenter }}"
+        folder: "{{ vm.folder }}"
+      register: snap_info
+
+    - name: Show snapshot info (debug)
+      ansible.builtin.debug:
+        var: snap_info.guest_snapshots.snapshots
+
+    - name: Create snapshot if none exist
+      community.vmware.vmware_guest_snapshot:
+        name: "{{ vm.guest_name }}"
+        datacenter: "{{ vm.datacenter }}"
+        folder: "{{ vm.folder }}"
+        snapshot_name: "{{ snapshot_name }}"
+        state: present
+      when: (snap_info.guest_snapshots.snapshots | default([])) | length == 0
+
+    - name: Get snapshot info post snapshot
+      community.vmware.vmware_guest_snapshot_info:
+        name: "{{ vm.guest_name }}"
+        datacenter: "{{ vm.datacenter }}"
+        folder: "{{ vm.folder }}"
+      register: snap_info
+
+    - name: Show snapshot info post snapshot (debug)
+      ansible.builtin.debug:
+        var: snap_info.guest_snapshots.snapshots

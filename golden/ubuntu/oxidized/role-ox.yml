@@ -1,0 +1,8 @@
+
+---
+- name: Deploy Oxidized
+  hosts: oxidized
+  become: true
+
+  roles:
+    - role: oxidized

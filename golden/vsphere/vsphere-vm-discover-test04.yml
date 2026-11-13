@@ -1,0 +1,51 @@
+---
+- name: Discover details from known-good Ubuntu VM
+  hosts: vsphere
+  gather_facts: false
+
+  vars_files:
+    - ../../inventories/dev/group_vars/vsphere/vault.yml
+
+  vars:
+    target_vm_name: "test-04"
+
+  tasks:
+    - name: Gather information for target VM
+      community.vmware.vmware_guest_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ datacenter_info_name | default(omit) }}"
+        name: "{{ target_vm_name }}"
+      register: target_vm_info
+    
+    - name: Gather distributed portgroup information
+      community.vmware.vmware_dvs_portgroup_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ discovered_datacenter }}"
+      register: dvs_portgroup_info
+      failed_when: false
+
+    - name: Show full VM info
+      ansible.builtin.debug:
+        var: target_vm_info
+
+    - name: Show useful deployment details
+      ansible.builtin.debug:
+        msg:
+          - "VM name: {{ target_vm_info.instance.hw_name | default('unknown') }}"
+          - "Guest full name: {{ target_vm_info.instance.hw_guest_full_name | default('unknown') }}"
+          - "Power state: {{ target_vm_info.instance.hw_power_status | default('unknown') }}"
+          - "Folder: {{ target_vm_info.instance.hw_folder | default('unknown') }}"
+          - "Cluster: {{ target_vm_info.instance.hw_cluster | default('unknown') }}"
+          - "ESXi host: {{ target_vm_info.instance.hw_esxi_host | default('unknown') }}"
+          - "Datacenter: {{ target_vm_info.instance.hw_datacenter | default('unknown') }}"
+          - "Datastore URL: {{ target_vm_info.instance.hw_datastores | default([]) }}"
+          - "IP address: {{ target_vm_info.instance.ipv4 | default('unknown') }}"
+          - "MAC addresses: {{ target_vm_info.instance.hw_eth0.macaddress | default('unknown') }}"
+          - "Network label: {{ target_vm_info.instance.hw_eth0.label | default('unknown') }}"
+          - "Portgroup/network: {{ target_vm_info.instance.hw_eth0.summary | default('unknown') }}"

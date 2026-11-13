@@ -1,0 +1,156 @@
+---
+- name: Deploy or delete Ubuntu VM(s) in vSphere
+  hosts: vcsa-edc
+  gather_facts: false
+
+  vars_files:
+    - ../../inventories/dev/group_vars/vsphere/vault.yml
+    - ../../inventories/dev/group_vars/vsphere/deploy.yml
+
+  vars:
+    # Options: deploy, delete
+    vm_action: "deploy"
+
+    # --- Single VM defaults ---
+    vm_name: "p-grafana-01"
+    vm_ip: "172.19.2.207"
+    vm_cpu: 2
+    vm_memory_mb: 4096
+    vm_disk_gb: 60
+    vm_template: "{{ ubuntu_2404_template }}"
+
+    # --- VM list ---
+    vm_list:
+      - name: "{{ vm_name }}"
+        ip: "{{ vm_ip }}"
+        cpu: "{{ vm_cpu }}"
+        memory_mb: "{{ vm_memory_mb }}"
+        disk_gb: "{{ vm_disk_gb }}"
+
+  tasks:
+    # ------------------------------------------------
+    # Validation
+    # ------------------------------------------------
+    - name: Validate vm_action
+      ansible.builtin.assert:
+        that:
+          - vm_action in ['deploy', 'delete']
+        fail_msg: "vm_action must be either 'deploy' or 'delete'."
+
+    - name: Show execution plan
+      ansible.builtin.debug:
+        msg:
+          - "Action: {{ vm_action }}"
+          - "VMs:"
+          - "{{ vm_list | map(attribute='name') | list }}"
+
+    # ------------------------------------------------
+    # DELETE WORKFLOW
+    # ------------------------------------------------
+    - name: Confirm delete target(s)
+      ansible.builtin.debug:
+        msg:
+          - "DELETE MODE ENABLED"
+          - "This will power off and remove the following VMs:"
+          - "{{ vm_list | map(attribute='name') | list }}"
+      when: vm_action == "delete"
+
+    - name: Power off VM(s) before deletion
+      vmware.vmware.vm_powerstate:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        name: "{{ item.name }}"
+        state: powered-off
+      loop: "{{ vm_list }}"
+      when: vm_action == "delete"
+
+    - name: Delete VM(s) from disk
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        name: "{{ item.name }}"
+        state: absent
+        force: true
+      loop: "{{ vm_list }}"
+      when: vm_action == "delete"
+
+    - name: Show deleted VM(s)
+      ansible.builtin.debug:
+        msg: "Deleted VM: {{ item.name }}"
+      loop: "{{ vm_list }}"
+      when: vm_action == "delete"
+
+    # ------------------------------------------------
+    # DEPLOY WORKFLOW
+    # ------------------------------------------------
+    - name: Deploy VM(s) from template
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+
+        datacenter: "{{ vcenter_datacenter }}"
+        cluster: "{{ vcenter_cluster }}"
+        folder: "{{ vcenter_folder }}"
+        name: "{{ item.name }}"
+        template: "{{ item.template | default(vm_template) }}"
+        datastore: "{{ vcenter_datastore }}"
+        state: poweredon
+
+        hardware:
+          num_cpus: "{{ item.cpu | default(vm_cpu) }}"
+          memory_mb: "{{ item.memory_mb | default(vm_memory_mb) }}"
+
+        disk:
+          - size_gb: "{{ item.disk_gb | default(vm_disk_gb) }}"
+            type: thick
+            datastore: "{{ vcenter_datastore }}"
+
+        networks:
+          - name: "{{ item.network | default(vsphere_network) }}"
+            type: static
+            ip: "{{ item.ip }}"
+            netmask: "{{ ubuntu_netmask }}"
+            gateway: "{{ ubuntu_gateway }}"
+            dns_servers: "{{ ubuntu_dns_servers }}"
+            domain: "{{ ubuntu_domain }}"
+
+        customization:
+          hostname: "{{ item.name }}"
+          domain: "{{ ubuntu_domain }}"
+          dns_servers: "{{ ubuntu_dns_servers }}"
+          timezone: "Australia/Brisbane"
+
+        wait_for_ip_address: true
+      loop: "{{ vm_list }}"
+      when: vm_action == "deploy"
+
+    - name: Show deployed VM(s)
+      ansible.builtin.debug:
+        msg:
+          - "Deployed VM: {{ item.name }}"
+          - "IP: {{ item.ip }}"
+          - "Template: {{ item.template | default(vm_template) }}"
+      loop: "{{ vm_list }}"
+      when: vm_action == "deploy"
+
+    # ------------------------------------------------
+    # Dynamic Inventory
+    # ------------------------------------------------
+    - name: Add deployed VM(s) to dynamic inventory
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        ansible_host: "{{ item.ip }}"
+        ansible_user: template_admin
+        ansible_python_interpreter: /usr/bin/python3
+        groups:
+          - ansible_managed_ubuntu
+          - grafana
+      loop: "{{ vm_list }}"
+      when: vm_action == "deploy"

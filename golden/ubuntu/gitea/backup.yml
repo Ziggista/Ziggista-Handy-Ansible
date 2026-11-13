@@ -1,0 +1,218 @@
+---
+- name: Backup Gitea
+  hosts: gitea
+  become: true
+
+  vars:
+    backup_root: /backup
+
+    gitea_user: git
+    gitea_service: gitea
+
+    gitea_home: /var/lib/gitea
+    gitea_config_dir: /etc/gitea
+    gitea_log_dir: /var/log/gitea
+
+    gitea_repositories_dir: "{{ gitea_home }}/repositories"
+    gitea_data_dir: "{{ gitea_home }}/data"
+
+    # PostgreSQL settings
+    gitea_db_name: gitea
+    gitea_db_user: gitea
+    # gitea_db_password: "{{ gitea_db_password }}"
+
+    # Retention
+    backup_retention: 12
+
+    # Timestamped backup folder
+    backup_timestamp: "{{ ansible_date_time.date }}"
+    backup_dir: "{{ backup_root }}/{{ backup_timestamp }}"
+    working_dir: "{{ backup_dir }}/working"
+
+    archive_name: "gitea-backup-{{ backup_timestamp }}.7z"
+    archive_path: "{{ backup_dir }}/{{ archive_name }}"
+
+  tasks:
+
+    - name: Ensure p7zip is installed
+      package:
+        name: p7zip-full
+        state: present
+
+    - name: Ensure backup root exists
+      file:
+        path: "{{ backup_root }}"
+        state: directory
+        mode: "0755"
+
+    - name: Create backup directory
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Create working directory
+      file:
+        path: "{{ working_dir }}"
+        state: directory
+        mode: "0755"
+
+    - block:
+
+        - name: Stop Gitea
+          service:
+            name: "{{ gitea_service }}"
+            state: stopped
+
+        - name: Remove any previous temporary dump files
+          find:
+            paths: /tmp
+            patterns: "gitea-dump-*.zip"
+          register: old_dumps
+
+        - name: Delete previous temporary dump files
+          file:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ old_dumps.files }}"
+
+        - name: Run Gitea dump
+          command: >
+            runuser -u {{ gitea_user }} --
+            gitea dump -c {{ gitea_config_dir }}/app.ini
+          args:
+            chdir: /tmp
+
+        - name: Locate generated Gitea dump
+          find:
+            paths: /tmp
+            patterns: "gitea-dump-*.zip"
+          register: gitea_dump
+
+        - name: Copy Gitea dump into backup working area
+          copy:
+            src: "{{ gitea_dump.files[0].path }}"
+            dest: "{{ working_dir }}/"
+            remote_src: true
+
+        - name: Backup PostgreSQL database
+          shell: >
+            PGPASSWORD='{{ gitea_db_password }}'
+            pg_dump
+            -h 127.0.0.1
+            -p 5432
+            -U {{ gitea_db_user }}
+            {{ gitea_db_name }}
+            > {{ working_dir }}/postgresql.sql
+          no_log: true
+          changed_when: true
+
+        - name: Backup Gitea configuration
+          command:
+            argv:
+              - tar
+              - -czf
+              - "{{ working_dir }}/gitea-config.tar.gz"
+              - "{{ gitea_config_dir }}"
+          changed_when: true
+
+        - name: Backup Gitea repositories
+          command:
+            argv:
+              - tar
+              - -czf
+              - "{{ working_dir }}/gitea-repositories.tar.gz"
+              - "{{ gitea_repositories_dir }}"
+          changed_when: true
+
+        - name: Backup Gitea data
+          command:
+            argv:
+              - tar
+              - -czf
+              - "{{ working_dir }}/gitea-data.tar.gz"
+              - "{{ gitea_data_dir }}"
+          changed_when: true
+
+        - name: Backup Gitea logs
+          command:
+            argv:
+              - tar
+              - -czf
+              - "{{ working_dir }}/gitea-logs.tar.gz"
+              - "{{ gitea_log_dir }}"
+          changed_when: true
+
+      always:
+
+        - name: Ensure Gitea is running
+          service:
+            name: "{{ gitea_service }}"
+            state: started
+
+    - name: Create maximum-compression 7z archive
+      command:
+        argv:
+          - 7z
+          - a
+          - -t7z
+          - -mx=9
+          - -m0=lzma2
+          - -md=512m
+          - -mfb=273
+          - -ms=on
+          - "{{ archive_path }}"
+          - "{{ working_dir }}/"
+      changed_when: true
+
+    - name: Verify archive exists
+      stat:
+        path: "{{ archive_path }}"
+      register: backup_archive
+
+    - name: Remove working directory after successful archive creation
+      file:
+        path: "{{ working_dir }}"
+        state: absent
+      when: backup_archive.stat.exists
+
+    - name: Remove temporary Gitea dump file
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ gitea_dump.files }}"
+      when:
+        - gitea_dump is defined
+        - gitea_dump.files | length > 0
+
+    - name: Find all backup directories
+      find:
+        paths: "{{ backup_root }}"
+        file_type: directory
+        recurse: false
+      register: backup_dirs
+
+    - name: Select old backups for removal
+      set_fact:
+        backups_to_remove: >-
+          {{
+            backup_dirs.files
+            | sort(attribute='mtime', reverse=True)
+            | map(attribute='path')
+            | list
+            | slice(backup_retention, 9999)
+            | first
+          }}
+
+    - name: Remove expired backup directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ backups_to_remove | default([]) }}"
+
+    - name: Display backup summary
+      debug:
+        msg:
+          - "Backup completed successfully"
+          - "Archive: {{ archive_path }}"
+          - "Retention: {{ backup_retention }}"

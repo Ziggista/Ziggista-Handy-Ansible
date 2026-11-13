@@ -1,0 +1,9 @@
+---
+- name: Deploy AWX service account
+  hosts: ansible_managed_ubuntu
+  become: yes
+
+  roles:
+    - role: svc_awx_linux
+      vars:
+        svc_awx_pubkey: "{{ lookup('file', '../files/svc_awx_linux_ed25519.pub') }}"

@@ -1,0 +1,32 @@
+---
+- name: List VMs in vSphere
+  hosts: vsphere
+  gather_facts: no
+
+  tasks:
+    - name: Authenticate to vCenter
+      ansible.builtin.uri:
+        url: "https://{{ vcenter_hostname }}/rest/com/vmware/cis/session"
+        method: POST
+        user: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        force_basic_auth: yes
+        validate_certs: true
+      register: login
+
+    - name: Get VM list
+      ansible.builtin.uri:
+        url: "https://{{ vcenter_hostname }}/rest/vcenter/vm"
+        method: GET
+        headers:
+          vmware-api-session-id: "{{ login.json.value }}"
+        validate_certs: true
+      register: vm_list
+
+
+    - name: Show VM power state
+      ansible.builtin.debug:
+        msg: "{{ item.name }} is {{ item.power_state }}"
+      loop: "{{ vm_list.json.value }}"
+      when: item.name == 'P-UISP-01'
+

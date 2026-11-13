@@ -1,0 +1,112 @@
+---
+- name: Discover vSphere defaults for Ubuntu template deployment
+  hosts: vsphere
+  gather_facts: false
+
+  vars_files:
+    - ../../inventories/dev/group_vars/vsphere/vault.yml
+
+  tasks:
+    - name: Gather datacenter information
+      community.vmware.vmware_datacenter_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+      register: datacenter_info
+
+    - name: Set discovered datacenter name
+      ansible.builtin.set_fact:
+        discovered_datacenter: "{{ datacenter_info.datacenter_info[0].name }}"
+
+    - name: Show discovered datacenter
+      ansible.builtin.debug:
+        msg: "Using datacenter: {{ discovered_datacenter }}"
+
+    - name: Gather cluster information
+      community.vmware.vmware_cluster_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ discovered_datacenter }}"
+      register: cluster_info
+
+    - name: Show clusters
+      ansible.builtin.debug:
+        var: cluster_info.clusters
+
+    - name: Gather datastore information
+      community.vmware.vmware_datastore_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter_name: "{{ discovered_datacenter }}"
+      register: datastore_info
+
+    - name: Show datastore names
+      ansible.builtin.debug:
+        msg: "{{ datastore_info.datastores | map(attribute='name') | list | sort }}"
+
+    - name: Gather standard portgroup information
+      community.vmware.vmware_portgroup_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        cluster_name: "{{ item.key }}"
+      loop: "{{ cluster_info.clusters | dict2items }}"
+      register: standard_portgroup_info
+      failed_when: false
+
+    - name: Show standard portgroups raw
+      ansible.builtin.debug:
+        var: standard_portgroup_info
+
+    - name: Gather distributed portgroup information
+      community.vmware.vmware_dvs_portgroup_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+        datacenter: "{{ discovered_datacenter }}"
+      register: dvs_portgroup_info
+      failed_when: false
+
+    - name: Show distributed portgroups raw
+      ansible.builtin.debug:
+        var: dvs_portgroup_info
+
+    - name: Gather all VM information
+      community.vmware.vmware_vm_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: "{{ vcenter_validate_certs }}"
+      register: vm_info
+
+    - name: Show VM/template names containing ubuntu
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            vm_info.virtual_machines
+            | selectattr('vm_name', 'defined')
+            | selectattr('vm_name', 'search', '(?i)ubuntu')
+            | map(attribute='vm_name')
+            | list
+            | sort
+          }}
+
+    - name: Show VM/template folder paths containing ubuntu
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            vm_info.virtual_machines
+            | selectattr('vm_name', 'defined')
+            | selectattr('vm_name', 'search', '(?i)ubuntu')
+            | map(attribute='folder')
+            | list
+            | unique
+            | sort
+          }}

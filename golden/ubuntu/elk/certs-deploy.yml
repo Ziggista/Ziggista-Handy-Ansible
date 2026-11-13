@@ -1,0 +1,80 @@
+---
+- name: Generate SSL private keys and CSRs for ELK
+  hosts:
+    # - elasticsearch
+    # - logstash
+    # - kibana
+    - oxidized
+  become: true
+
+  vars:
+    cert_dir: /etc/cert/2026
+
+  tasks:
+
+    - name: Ensure certificate directory exists
+      file:
+        path: "{{ cert_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Create OpenSSL SAN configuration
+      copy:
+        dest: "{{ cert_dir }}/openssl-san.cnf"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          [ req ]
+          default_bits       = 4096
+          distinguished_name = req_distinguished_name
+          req_extensions     = v3_req
+          prompt             = no
+
+          [ req_distinguished_name ]
+          C            = AU
+          ST           = Queensland
+          L            = Rockhampton
+          O            = Rockhampton Regional Council
+          CN           = {{ inventory_hostname }}.rrc.local
+
+          [ v3_req ]
+          subjectAltName = @alt_names
+
+          [ alt_names ]
+          DNS.1   = {{ inventory_hostname }}.rrc.local
+          DNS.2   = {{ inventory_hostname }}
+          IP.1    = {{ ansible_default_ipv4.address }}
+
+    - name: Generate private key
+      command:
+        cmd: >
+          openssl genrsa
+          -out {{ cert_dir }}/{{ inventory_hostname }}.key
+          4096
+      args:
+        creates: "{{ cert_dir }}/{{ inventory_hostname }}.key"
+
+    - name: Restrict private key permissions
+      file:
+        path: "{{ cert_dir }}/{{ inventory_hostname }}.key"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Generate CSR
+      command:
+        cmd: >
+          openssl req
+          -new
+          -key {{ cert_dir }}/{{ inventory_hostname }}.key
+          -out {{ cert_dir }}/{{ inventory_hostname }}.csr
+          -config {{ cert_dir }}/openssl-san.cnf
+      args:
+        creates: "{{ cert_dir }}/{{ inventory_hostname }}.csr"
+
+    - name: Display CSR location
+      debug:
+        msg: "CSR created: {{ cert_dir }}/{{ inventory_hostname }}.csr"

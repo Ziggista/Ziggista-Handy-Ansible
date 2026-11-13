@@ -1,0 +1,101 @@
+---
+- name: Configure remote syslog forwarding to Logstash
+  hosts: ansible_managed_ubuntu:!logstash
+  become: true
+
+  vars:
+    logstash_servers:
+      - 172.19.2.198
+      - 172.19.2.199
+
+  tasks:
+
+    - name: Ensure rsyslog is installed
+      ansible.builtin.package:
+        name: rsyslog
+        state: present
+
+    - name: Check for existing active Storage setting
+      ansible.builtin.shell:
+        cmd: grep -E '^Storage=' /etc/systemd/journald.conf
+      register: journald_storage
+      changed_when: false
+      failed_when: false
+
+    - name: Comment existing active Storage setting
+      ansible.builtin.replace:
+        path: /etc/systemd/journald.conf
+        regexp: '^Storage=(.*)$'
+        replace: '# Storage=\1'
+      when: journald_storage.rc == 0
+      notify: Restart journald
+
+    - name: Check for existing active ForwardToSyslog setting
+      ansible.builtin.shell:
+        cmd: grep -E '^ForwardToSyslog=' /etc/systemd/journald.conf
+      register: journald_forward
+      changed_when: false
+      failed_when: false
+
+    - name: Comment existing active ForwardToSyslog setting
+      ansible.builtin.replace:
+        path: /etc/systemd/journald.conf
+        regexp: '^ForwardToSyslog=(.*)$'
+        replace: '# ForwardToSyslog=\1'
+      when: journald_forward.rc == 0
+      notify: Restart journald
+
+    - name: Configure journald settings
+      ansible.builtin.blockinfile:
+        path: /etc/systemd/journald.conf
+        marker: "# {mark} ANSIBLE MANAGED JOURNALD SETTINGS"
+        insertbefore: EOF
+        block: |
+          [Journal]
+          Storage=persistent
+          ForwardToSyslog=yes
+      notify: Restart journald
+
+    - name: Deploy rsyslog forwarding configuration
+      ansible.builtin.blockinfile:
+        path: /etc/rsyslog.d/50-logstash-forwarding.conf
+        create: true
+        owner: root
+        group: root
+        mode: "0644"
+        marker: "# {mark} ANSIBLE MANAGED LOGSTASH FORWARDING"
+        block: |
+          {% for server in logstash_servers %}
+          *.* action(
+              type="omfwd"
+              target="{{ server }}"
+              port="514"
+              protocol="tcp"
+              queue.type="linkedList"
+              queue.filename="logstash_{{ server | replace('.', '_') }}"
+              queue.maxdiskspace="2g"
+              queue.saveonshutdown="on"
+              action.resumeRetryCount="-1"
+          )
+
+          {% endfor %}
+      notify: Validate and restart rsyslog
+
+  handlers:
+
+    - name: Restart journald
+      ansible.builtin.service:
+        name: systemd-journald
+        state: restarted
+
+    - name: Validate rsyslog configuration
+      ansible.builtin.command:
+        cmd: rsyslogd -N1
+      changed_when: false
+      listen: Validate and restart rsyslog
+
+    - name: Restart rsyslog
+      ansible.builtin.service:
+        name: rsyslog
+        state: restarted
+      listen: Validate and restart rsyslog

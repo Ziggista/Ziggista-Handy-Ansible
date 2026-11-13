@@ -1,0 +1,80 @@
+
+---
+- name: Install Rapid7 Insight Agent (DEB)
+  hosts: ansible_managed_ubuntu
+  become: yes
+
+  vars:
+    rapid7_token: "au:a3754ca5-7a1e-4aa4-8ad6-60c7f97d39dc"
+    local_deb_path: "/home/dixk/ansible-lab/files/rapid7-insight-agent_4.1.0.2-1_amd64.deb"
+    remote_deb_path: "/tmp/rapid7-agent.deb"
+
+
+
+
+  tasks:
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Check if Rapid7 agent is installed and running
+      ansible.builtin.set_fact:
+        agent_running: >-
+          {{
+            'ir_agent.service' in ansible_facts.services and
+            ansible_facts.services['ir_agent.service'].state == 'running'
+          }}
+
+    - name: Copy Rapid7 deb to host
+      ansible.builtin.copy:
+        src: "{{ local_deb_path }}"
+        dest: "{{ remote_deb_path }}"
+        mode: "0644"
+      when: not agent_running
+
+    - name: Install Rapid7 agent
+      ansible.builtin.apt:
+        deb: "{{ remote_deb_path }}"
+      when: not agent_running
+
+
+    - name: Find Insight Agent version directory
+      ansible.builtin.find:
+        paths: /opt/rapid7/ir_agent/components/insight_agent/
+        file_type: directory
+      register: agent_dirs
+
+    - name: Set latest agent directory
+      ansible.builtin.set_fact:
+        agent_dir: "{{ agent_dirs.files | map(attribute='path') | sort | last }}"
+
+
+
+    - name: Find configure_agent.sh
+      ansible.builtin.find:
+        paths: /opt/rapid7/ir_agent/components/insight_agent/
+        patterns: configure_agent.sh
+        recurse: yes
+      register: agent_script
+
+    
+    - name: Fail if script not found
+      ansible.builtin.fail:
+        msg: "configure_agent.sh not found"
+      when: agent_script.files | length == 0
+
+
+    - name: Configure agent with token
+      ansible.builtin.command: >
+        {{ agent_script.files[0].path }}
+        --token={{ rapid7_token }} -v --start
+      args:
+        creates: /etc/opt/rapid7/ir_agent/agent.cfg
+      when: not agent_running
+
+
+
+    - name: Ensure agent service is running
+      ansible.builtin.service:
+        name: ir_agent
+        state: started
+        enabled: yes

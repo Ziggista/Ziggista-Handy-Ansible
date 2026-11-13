@@ -1,0 +1,116 @@
+---
+- name: Deploy signed FreeRADIUS certificates
+  hosts: radius
+  become: true
+
+  tasks:
+
+    - name: Ensure certificate directory exists
+      ansible.builtin.file:
+        path: "{{ cert_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Copy signed certificate
+      ansible.builtin.copy:
+        src: "/home/dixk/ansible-lab/csrs/{{ inventory_hostname }}.cer"
+        dest: "{{ server_cert }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Copy AD CS root CA
+      ansible.builtin.copy:
+        src: /home/dixk/ansible-lab/CertSrv-2036-4096.cer
+        dest: "{{ root_ca }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Verify certificate exists
+      ansible.builtin.stat:
+        path: "{{ server_cert }}"
+      register: radius_cert
+
+    - name: Fail if certificate missing
+      ansible.builtin.fail:
+        msg: "Certificate {{ server_cert }} not found"
+      when: not radius_cert.stat.exists
+
+    - name: Read certificate details
+      ansible.builtin.command:
+        cmd: >-
+          openssl x509
+          -in {{ server_cert }}
+          -text
+          -noout
+      register: cert_info
+      changed_when: false
+
+    - name: Verify certificate contains Server Authentication EKU
+      ansible.builtin.assert:
+        that:
+          - "'TLS Web Server Authentication' in cert_info.stdout"
+        fail_msg: >-
+          Issued certificate does not contain the
+          Server Authentication EKU required by EAP-TLS.
+
+    - name: Verify expected FQDN exists in certificate
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname ~ '.' ~ radius_domain in cert_info.stdout
+        fail_msg: >-
+          Certificate SAN/CN does not contain the expected hostname.
+
+    - name: Display certificate validity
+      ansible.builtin.command:
+        cmd: >-
+          openssl x509
+          -in {{ server_cert }}
+          -noout
+          -dates
+      register: cert_dates
+      changed_when: false
+
+    - name: Show certificate subject
+      ansible.builtin.command:
+        cmd: >-
+          openssl x509
+          -in {{ server_cert }}
+          -noout
+          -subject
+      register: cert_subject
+      changed_when: false
+
+    - name: Show certificate SANs
+      ansible.builtin.command:
+        cmd: >-
+          openssl x509
+          -in {{ server_cert }}
+          -noout
+          -ext subjectAltName
+      register: cert_san
+      changed_when: false
+
+    - name: Display certificate information
+      ansible.builtin.debug:
+        msg:
+          - "{{ cert_subject.stdout }}"
+          - "{{ cert_dates.stdout }}"
+          - "{{ cert_san.stdout }}"
+
+    - name: Set FreeRADIUS key permissions
+      ansible.builtin.file:
+        path: "{{ server_key }}"
+        owner: root
+        group: freerad
+        mode: "0640"
+    
+    - name: Set FreeRADIUS cert permissions
+      ansible.builtin.file:
+        path: "{{ server_cert }}"
+        owner: root
+        group: freerad
+        mode: "0644"

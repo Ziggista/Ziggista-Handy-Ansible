@@ -1,0 +1,28 @@
+---
+- name: Update Ubuntu systems
+  hosts: ansible_managed_ubuntu
+  become: yes
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        upgrade: dist
+
+    - name: Remove unused packages
+      ansible.builtin.apt:
+        autoremove: yes
+
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Show reboot requirement
+      ansible.builtin.debug:
+        msg: "Reboot is required"
+      when: reboot_required.stat.exists
+

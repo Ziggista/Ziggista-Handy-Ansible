@@ -1,0 +1,221 @@
+---
+- name: Join Linux servers to Active Directory with SSSD
+  hosts: ansible_managed_ubuntu
+  become: true
+
+  vars:
+    ad_domain: "rrc.local"
+    ad_join_user: "dixk_a"
+
+    # Groups permitted to SSH
+    ad_ssh_groups:
+      - "sa-it-p-elk"
+      # - "sa-it-p-radius"
+
+    # PAM-only group for Oxidized hosts
+    oxidized_pam_group: "SA-IT-P-OXIDIZED-01-Admins"
+
+    # Authentication groups:
+    # SSH groups + Oxidized group on oxidized hosts only
+    ad_auth_groups: >-
+      {{
+        ad_ssh_groups
+        +
+        (
+          [oxidized_pam_group]
+          if 'oxidized' in group_names
+          else []
+        )
+      }}
+
+    # Privilege group
+    ad_sudo_group: "IT_Linux_Admins"
+
+    # Consistent Linux group
+    linux_default_group: "linux_users"
+    linux_default_gid: 10000
+
+  vars_prompt:
+    - name: ad_join_password
+      prompt: "Enter AD join account password"
+      private: yes
+
+  tasks:
+
+    # ------------------------------------------------
+    # Prerequisites
+    # ------------------------------------------------
+    - name: Install required packages
+      apt:
+        name:
+          - realmd
+          - sssd
+          - sssd-tools
+          - adcli
+          - samba-common-bin
+          - oddjob
+          - oddjob-mkhomedir
+          - packagekit
+        state: present
+        update_cache: yes
+
+    - name: Ensure time sync is enabled (Kerberos requirement)
+      service:
+        name: systemd-timesyncd
+        state: started
+        enabled: true
+
+    - name: Check if LOCAL conflicting user exists
+      shell: "grep '^dixk_a:' /etc/passwd"
+      register: local_user_check
+      changed_when: false
+      failed_when: false
+
+    - name: Rename local user if it exists (avoid AD conflict)
+      when: local_user_check.rc == 0
+      block:
+
+        - name: Rename user account
+          command: usermod -l dixk_a_local dixk_a
+
+        - name: Rename home directory
+          command: usermod -d /home/dixk_a_local -m dixk_a_local
+
+        - name: Fix ownership of home directory
+          file:
+            path: /home/dixk_a_local
+            owner: dixk_a_local
+            recurse: yes
+
+        - name: Debug rename action
+          debug:
+            msg: "Local user dixk_a renamed to dixk_a_local to avoid AD conflict"
+
+    # ------------------------------------------------
+    # Join Active Directory
+    # ------------------------------------------------
+    - name: Join the Active Directory domain
+      command: >
+        realm join {{ ad_domain }}
+        -U {{ ad_join_user }}
+        --computer-ou="OU=LINUX,OU=Servers,OU=RRC,DC=RRC,DC=LOCAL"
+      args:
+        creates: /etc/krb5.keytab
+        stdin: "{{ ad_join_password }}"
+
+    - name: Enable automatic home directory creation
+      command: pam-auth-update --enable mkhomedir
+      changed_when: false
+
+    # ------------------------------------------------
+    # Linux default group
+    # ------------------------------------------------
+    - name: Ensure shared Linux users group exists
+      group:
+        name: "{{ linux_default_group }}"
+        gid: "{{ linux_default_gid }}"
+        state: present
+
+    # ------------------------------------------------
+    # SSSD Configuration
+    # ------------------------------------------------
+    - name: Configure SSSD access control
+      blockinfile:
+        path: /etc/sssd/sssd.conf
+        marker: "# {mark} ANSIBLE MANAGED SSSD SETTINGS"
+        block: |
+          access_provider = simple
+          simple_allow_groups = {{ ad_auth_groups | join(',') }}
+          use_fully_qualified_names = False
+          override_gid = {{ linux_default_gid }}
+          fallback_homedir = /home/%u
+          default_shell = /bin/bash
+          ignore_group_members = true
+          enumerate = false
+
+    - name: Ensure correct permissions on sssd.conf
+      file:
+        path: /etc/sssd/sssd.conf
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Restart SSSD
+      service:
+        name: sssd
+        state: restarted
+
+    # ------------------------------------------------
+    # Sudo configuration
+    # ------------------------------------------------
+    - name: Configure sudo access for AD admins
+      copy:
+        dest: /etc/sudoers.d/ad-admins
+        content: "%{{ ad_sudo_group }} ALL=(ALL) ALL"
+        mode: "0440"
+
+    - name: Ensure local SSH access group exists
+      group:
+        name: local-ssh-allowed
+        state: present
+
+    - name: Check if template_admin exists
+      stat:
+        path: /home/template_admin
+      register: template_admin_exists
+
+    - name: Add template_admin to local SSH group
+      user:
+        name: template_admin
+        groups: local-ssh-allowed
+        append: yes
+      when: template_admin_exists.stat.exists
+
+    - name: Check if dixk_ansible exists
+      stat:
+        path: /home/dixk_ansible
+      register: dixk_ansible_exists
+
+    - name: Add dixk_ansible to local SSH group
+      user:
+        name: dixk_ansible
+        groups: local-ssh-allowed
+        append: yes
+      when: dixk_ansible_exists.stat.exists
+
+    # ------------------------------------------------
+    # SSH hardening
+    # ------------------------------------------------
+    - name: Configure SSH access control
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED SSH ACCESS"
+        block: |
+          AllowGroups local-ssh-allowed {{ ad_ssh_groups | map('lower') | join(' ') }}
+
+    - name: Disable root SSH login
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin'
+        line: 'PermitRootLogin no'
+
+    - name: Restart SSH service
+      service:
+        name: ssh
+        state: restarted
+
+    # ------------------------------------------------
+    # Debug / validation
+    # ------------------------------------------------
+    - name: Show authentication groups
+      debug:
+        msg: "Allowed PAM groups: {{ ad_auth_groups }}"
+
+    - name: Show SSSD status
+      command: systemctl is-active sssd
+      register: sssd_status
+      changed_when: false
+
+    - name: Debug SSSD status
+      debug:
+        msg: "SSSD status: {{ sssd_status.stdout }}"

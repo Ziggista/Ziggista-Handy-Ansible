@@ -1,0 +1,76 @@
+
+---
+- name: Secure GRUB with password while allowing automated boots
+  hosts: ansible_managed_ubuntu
+  become: true
+
+  vars:
+    grub_superuser: "grub-user"
+    # Generate this with: grub-mkpasswd-pbkdf2
+    grub_password_hash: "grub.pbkdf2.sha512.10000.2F5AFC1A8B152BC94C24BB87D87998D0178716F4043CEA98DD4F7A08EC1EE4FF3D8828DAC78650FEF2E69F56F94A020C1E719BE0420481786B590B55E7E79184.06F42429ECDB68D409CC84CD5433BB34E07073D7BE87E65554A3EEB7A31AB82BCC58B712C8AA273D2A26F95B60E5A2D7E6E16F029C6B40D76066DB75D6F0C787"
+
+  tasks:
+    - name: Ensure /etc/grub.d/01_users exists
+      copy:
+        dest: /etc/grub.d/01_users
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          cat <<EOF
+          set superusers="{{ grub_superuser }}"
+          password_pbkdf2 {{ grub_superuser }} {{ grub_password_hash }}
+          EOF
+
+    - name: Ensure GRUB menu entries remain unrestricted
+      lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_CMDLINE_LINUX='
+        line: 'GRUB_CMDLINE_LINUX=""'
+
+    - name: Ensure GRUB allows unrestricted default entries
+      lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_DISABLE_SUBMENU='
+        line: 'GRUB_DISABLE_SUBMENU=y'
+        create: yes
+
+
+    - name: Ensure GRUB CLASS includes --unrestricted
+      lineinfile:
+        path: /etc/grub.d/10_linux
+        regexp: '^CLASS='
+        line: 'CLASS="--class gnu-linux --class gnu --class os --unrestricted"'
+        backup: yes
+
+
+
+    # - name: Add --unrestricted to recovery menuentries
+    #   replace:
+    #     path: /etc/grub.d/10_linux
+    #     regexp: '(^menuentry .+recovery mode.*)'
+    #     replace: '\1 --unrestricted'
+
+    - name: Update grub config
+      command: update-grub
+    
+    - name: Check final generated grub.cfg entries
+      shell: grep menuentry /boot/grub/grub.cfg
+      register: grub_cfg_entries
+
+    - name: Show grub.cfg menuentries
+      debug:
+        var: grub_cfg_entries.stdout_lines
+    
+    
+    - name: Dump all grub.d scripts (full content)
+      shell: |
+        for f in /etc/grub.d/*; do
+          echo "===== $f ====="
+          head -n 50 "$f"
+        done
+      register: grub_full_dump
+
+    - name: Show full grub.d dump
+      debug:
+        var: grub_full_dump.stdout_lines
+

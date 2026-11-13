@@ -1,0 +1,191 @@
+- name: Deploy AWX with HTTPS + LDAP workaround (FINAL)
+  hosts: P-AWX-01
+  become: true
+
+  vars:
+    awx_namespace: awx
+    awx_name: awx
+    awx_hostname: awx.rrc.local
+
+    tls_dir: /opt/awx/tls
+    openssl_config_path: /opt/awx/openssl_awx.cnf
+
+    awx_custom_image: awx-custom-ca:24.2.0
+
+  tasks:
+
+    # ---------------------------
+    # Enable ingress
+    # ---------------------------
+    - name: Enable MicroK8s ingress
+      command: microk8s enable ingress
+      changed_when: false
+
+    # ---------------------------
+    # Namespace
+    # ---------------------------
+    - name: Ensure AWX namespace exists
+      command: microk8s kubectl create namespace {{ awx_namespace }}
+      ignore_errors: true
+
+    # ---------------------------
+    # TLS setup (idempotent)
+    # ---------------------------
+    - name: Ensure TLS directory exists
+      file:
+        path: "{{ tls_dir }}"
+        state: directory
+
+    - stat:
+        path: "{{ tls_dir }}/awx.key"
+      register: key_stat
+
+    - stat:
+        path: "{{ tls_dir }}/awx.crt"
+      register: crt_stat
+
+    - name: Generate key
+      command: openssl genrsa -out {{ tls_dir }}/awx.key 2048
+      when: not key_stat.stat.exists
+
+    - name: Generate cert
+      command: >
+        openssl req -x509 -nodes -days 365
+        -key {{ tls_dir }}/awx.key
+        -out {{ tls_dir }}/awx.crt
+        -subj "/CN={{ awx_hostname }}"
+      when: not crt_stat.stat.exists
+
+    - name: Apply TLS secret
+      shell: >
+        microk8s kubectl create secret tls awx-tls
+        --key {{ tls_dir }}/awx.key
+        --cert {{ tls_dir }}/awx.crt
+        -n {{ awx_namespace }}
+        --dry-run=client -o yaml |
+        microk8s kubectl apply -f -
+
+    # ---------------------------
+    # OpenSSL override config
+    # ---------------------------
+    - name: Create OpenSSL override config
+      copy:
+        dest: "{{ openssl_config_path }}"
+        content: |
+          openssl_conf = default_conf
+
+          [ default_conf ]
+          ssl_conf = ssl_sect
+
+          [ ssl_sect ]
+          system_default = ssl_default_sect
+
+          [ ssl_default_sect ]
+          MinProtocol = TLSv1.2
+          CipherString = DEFAULT:@SECLEVEL=1
+
+    - name: Apply OpenSSL ConfigMap
+      shell: |
+        microk8s kubectl create configmap openssl-legacy \
+          --from-file=openssl.cnf={{ openssl_config_path }} \
+          -n {{ awx_namespace }} \
+          --dry-run=client -o yaml | microk8s kubectl apply -f -
+
+    # ---------------------------
+    # AWX CR (FINAL WORKING SPEC)
+    # ---------------------------
+    - name: Create AWX CR
+      copy:
+        dest: /opt/awx/awx.yaml
+        content: |
+          apiVersion: awx.ansible.com/v1beta1
+          kind: AWX
+          metadata:
+            name: {{ awx_name }}
+            namespace: {{ awx_namespace }}
+
+          spec:
+            service_type: ClusterIP
+            ingress_type: ingress
+            hostname: {{ awx_hostname }}
+            ingress_tls_secret: awx-tls
+
+            image: "{{ awx_custom_image.split(':')[0] }}"
+            image_version: "{{ awx_custom_image.split(':')[1] }}"
+            image_pull_policy: IfNotPresent
+
+            # ✅ CORRECT env vars
+            web_extra_env: |
+              - name: OPENSSL_CONF
+                value: /etc/awx/openssl.cnf
+
+            task_extra_env: |
+              - name: OPENSSL_CONF
+                value: /etc/awx/openssl.cnf
+
+            # ✅ volumes
+            extra_volumes: |
+              - name: openssl-conf
+                configMap:
+                  name: openssl-legacy
+
+            # ✅ mounts (safe path)
+            web_extra_volume_mounts: |
+              - name: openssl-conf
+                mountPath: /etc/awx/openssl.cnf
+                subPath: openssl.cnf
+
+            task_extra_volume_mounts: |
+              - name: openssl-conf
+                mountPath: /etc/awx/openssl.cnf
+                subPath: openssl.cnf
+
+            projects_persistence: true
+            projects_storage_size: 5Gi
+            postgres_storage_class: microk8s-hostpath
+
+    - name: Apply AWX CR
+      command: microk8s kubectl apply -f /opt/awx/awx.yaml
+
+    # ---------------------------
+    # Restart pods
+    # ---------------------------
+    - name: Restart AWX pods
+      command: microk8s kubectl delete pod -n {{ awx_namespace }} --all
+      ignore_errors: true
+
+    # ---------------------------
+    # Wait for rollout
+    # ---------------------------
+    - name: Wait for AWX
+      command: >
+        microk8s kubectl rollout status deployment awx-web
+        -n {{ awx_namespace }}
+      register: rollout
+      retries: 30
+      delay: 10
+      until: rollout.rc == 0
+      changed_when: false
+
+    # ---------------------------
+    # Verify (important)
+    # ---------------------------
+    - name: Check OpenSSL env var
+      command: microk8s kubectl exec deploy/awx-web -n {{ awx_namespace }} -- env
+      register: env_output
+      changed_when: false
+
+    - name: Show OPENSSL vars
+      debug:
+        msg: "{{ env_output.stdout_lines | select('search','OPENSSL') | list }}"
+
+    # ---------------------------
+    # Final message
+    # ---------------------------
+    - name: Output result
+      debug:
+        msg:
+          - "✅ AWX deployed with HTTPS"
+          - "✅ OpenSSL workaround ACTIVE"
+          - "🌐 https://{{ awx_hostname }}"
+          - "✅ LDAP should now work"

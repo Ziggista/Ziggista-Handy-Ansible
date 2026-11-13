@@ -1,0 +1,49 @@
+---
+- name: Gather Oxidized configuration
+  hosts: P-OXIDIZED-01
+  become: true
+
+  vars:
+    oxidized_home: /etc/oxidized
+
+  tasks:
+
+    - name: Check if config file exists
+      stat:
+        path: "{{ oxidized_home }}/config"
+      register: oxidized_config_stat
+
+    - name: Fail if config is missing
+      fail:
+        msg: "Oxidized config not found at {{ oxidized_home }}/config"
+      when: not oxidized_config_stat.stat.exists
+
+    - name: Read Oxidized config file
+      slurp:
+        path: "{{ oxidized_home }}/config"
+      register: oxidized_config_raw
+
+    - name: Decode and parse YAML config
+      set_fact:
+        oxidized_config: "{{ oxidized_config_raw.content | b64decode | from_yaml }}"
+
+    - name: Show full parsed config (debug)
+      debug:
+        var: oxidized_config
+
+    - name: Extract key config values
+      set_fact:
+        oxidized_username: "{{ oxidized_config.username | default('undefined') }}"
+        oxidized_model: "{{ oxidized_config.model | default('undefined') }}"
+        oxidized_interval: "{{ oxidized_config.interval | default('undefined') }}"
+        oxidized_output_type: "{{ oxidized_config.output.default | default('undefined') }}"
+        oxidized_repo: "{{ oxidized_config.output.git.repo | default('undefined', true) }}"
+
+    - name: Display key Oxidized settings
+      debug:
+        msg:
+          - "Username: {{ oxidized_username }}"
+          - "Model: {{ oxidized_model }}"
+          - "Interval: {{ oxidized_interval }}"
+          - "Output Type: {{ oxidized_output_type }}"
+          - "Git Repo: {{ oxidized_repo }}"

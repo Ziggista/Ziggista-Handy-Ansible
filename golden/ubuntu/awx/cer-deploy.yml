@@ -1,0 +1,103 @@
+---
+- name: Deploy AWX Signed TLS Certificate
+  hosts: P-AWX-01
+  become: true
+
+  vars:
+    awx_namespace: awx
+    tls_dir: /opt/awx/tls
+
+  tasks:
+
+    # ---------------------------
+    # Ensure TLS directory exists
+    # ---------------------------
+    - name: Ensure TLS directory exists
+      file:
+        path: "{{ tls_dir }}"
+        state: directory
+        mode: "0755"
+
+    # ---------------------------
+    # Upload certificate
+    # ---------------------------
+    - name: Upload signed certificate
+      copy:
+        src: awx.rrc.local.cer
+        dest: "{{ tls_dir }}/awx.crt"
+        owner: root
+        group: root
+        mode: "0644"
+
+    # ---------------------------
+    # Check for optional private key
+    # ---------------------------
+    - name: Check if private key exists locally
+      delegate_to: localhost
+      run_once: true
+      become: false
+      stat:
+        path: "{{ playbook_dir }}/files/awx.rrc.local.key"
+      register: local_key_file
+
+    - name: Upload private key (only if provided)
+      copy:
+        src: awx.rrc.local.key
+        dest: "{{ tls_dir }}/awx.key"
+        owner: root
+        group: root
+        mode: "0600"
+      when: local_key_file.stat.exists
+
+    # ---------------------------
+    # Ensure key exists on server
+    # ---------------------------
+    - name: Fail if no private key exists
+      stat:
+        path: "{{ tls_dir }}/awx.key"
+      register: remote_key
+
+    - name: Stop if key missing
+      fail:
+        msg: "No private key found at {{ tls_dir }}/awx.key"
+      when: not remote_key.stat.exists
+
+    # ---------------------------
+    # Apply Kubernetes TLS secret
+    # ---------------------------
+    - name: Apply TLS secret
+      shell: >
+        microk8s kubectl create secret tls awx-tls
+        --key {{ tls_dir }}/awx.key
+        --cert {{ tls_dir }}/awx.crt
+        -n {{ awx_namespace }}
+        --dry-run=client -o yaml |
+        microk8s kubectl apply -f -
+
+    # ---------------------------
+    # Restart AWX pods
+    # ---------------------------
+    - name: Restart AWX pods
+      command: microk8s kubectl delete pod -n {{ awx_namespace }} --all
+      ignore_errors: true
+
+    # ---------------------------
+    # Wait for rollout
+    # ---------------------------
+    - name: Wait for AWX rollout
+      command: >
+        microk8s kubectl rollout status deployment awx-web -n {{ awx_namespace }}
+      register: rollout
+      retries: 30
+      delay: 10
+      until: rollout.rc == 0
+      changed_when: false
+
+    # ---------------------------
+    # Done
+    # ---------------------------
+    - name: Done
+      debug:
+        msg:
+          - "✅ AWX TLS updated"
+          - "🌐 https://awx.rrc.local"

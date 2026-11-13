@@ -1,0 +1,143 @@
+- name: Configure AWX LDAP CA trust (persistent via init container)
+  hosts: P-AWX-01
+  become: true
+
+  vars:
+    awx_namespace: awx
+    tls_dir: /opt/awx/tls
+
+    # Local (Ansible control node)
+    ca_cert_src: /home/dixk/ansible-lab/CertSrv-2036-4096.cer
+
+    # Remote (target node)
+    ca_cert_dest: ca.crt
+
+  tasks:
+
+    # ---------------------------
+    # Ensure TLS directory exists
+    # ---------------------------
+    - name: Ensure TLS directory exists
+      file:
+        path: "{{ tls_dir }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    # ---------------------------
+    # Copy CA cert to node
+    # ---------------------------
+    - name: Copy CA certificate to AWX node
+      copy:
+        src: "{{ ca_cert_src }}"
+        dest: "{{ tls_dir }}/{{ ca_cert_dest }}"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+
+    # ---------------------------
+    # Create Kubernetes secret
+    # ---------------------------
+    - name: Create or update LDAP CA secret
+      shell: |
+        microk8s kubectl create secret generic ldap-ca \
+          --from-file=ca.crt={{ tls_dir }}/{{ ca_cert_dest }} \
+          -n {{ awx_namespace }} \
+          --dry-run=client -o yaml | \
+        microk8s kubectl apply -f -
+      args:
+        executable: /bin/bash
+
+    # ---------------------------
+    # Update AWX CR with init container
+    # ---------------------------
+    - name: Update AWX CR for CA injection
+      copy:
+        dest: /opt/awx/awx.yaml
+        content: |
+          apiVersion: awx.ansible.com/v1beta1
+          kind: AWX
+          metadata:
+            name: awx
+            namespace: {{ awx_namespace }}
+          spec:
+            ingress_type: ingress
+            hostname: awx.rrc.local
+            ingress_tls_secret: awx-tls
+
+            projects_persistence: true
+            projects_storage_size: 5Gi
+            postgres_storage_class: microk8s-hostpath
+
+            extra_volumes: |
+              - name: ldap-ca
+                secret:
+                  secretName: ldap-ca
+
+            init_container_extra_commands: |
+              ls -l /etc/tower/conf.d/ldap-ca
+              cp /etc/tower/conf.d/ldap-ca/ca.crt /etc/pki/ca-trust/source/anchors/ca.crt
+              update-ca-trust
+
+
+    # ---------------------------
+    # Apply AWX configuration
+    # ---------------------------
+    - name: Apply AWX configuration
+      command: microk8s kubectl apply -f /opt/awx/awx.yaml
+
+    # ---------------------------
+    # Restart AWX
+    # ---------------------------
+    - name: Restart AWX web
+      command: microk8s kubectl rollout restart deployment awx-web -n {{ awx_namespace }}
+
+    - name: Restart AWX task
+      command: microk8s kubectl rollout restart deployment awx-task -n {{ awx_namespace }}
+
+    # ---------------------------
+    # Wait for AWX to be ready
+    # ---------------------------
+    - name: Wait for AWX web rollout
+      command: >
+        microk8s kubectl rollout status deployment awx-web
+        -n {{ awx_namespace }}
+      register: rollout
+      retries: 30
+      delay: 10
+      until: rollout.rc == 0
+      changed_when: false
+
+    # ---------------------------
+    # Get pod for verification
+    # ---------------------------
+    - name: Get AWX web pod
+      shell: >
+        microk8s kubectl get pods -n {{ awx_namespace }}
+        -l app.kubernetes.io/name=awx-web
+        -o jsonpath="{.items[0].metadata.name}"
+      register: awx_pod
+      changed_when: false
+
+    # ---------------------------
+    # Verify CA is now trusted
+    # ---------------------------
+    - name: Verify CA present in trust bundle
+      command: >
+        microk8s kubectl exec -n {{ awx_namespace }} {{ awx_pod.stdout }} --
+        grep -i certsrv /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+      register: ca_check
+      failed_when: ca_check.rc != 0
+      changed_when: false
+
+    # ---------------------------
+    # Success output
+    # ---------------------------
+    - name: Success
+      debug:
+        msg:
+          - "CA injected via init container (persistent)"
+          - "AWX trust store updated"
+          - "LDAPS should now validate correctly"
+          - "Test with openssl or AWX login"

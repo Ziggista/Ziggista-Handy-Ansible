@@ -1,0 +1,28 @@
+---
+- name: Disable ICMP Redirects
+  hosts: all
+  become: true
+  tasks:
+    - name: Disable accepting ICMP redirects
+      ansible.builtin.sysctl:
+        name: "{{ item }}"
+        value: '0'
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/99-icmp-redirects.conf
+      loop:
+        - net.ipv4.conf.all.accept_redirects
+        - net.ipv4.conf.default.accept_redirects
+        - net.ipv4.conf.all.secure_redirects
+        - net.ipv4.conf.default.secure_redirects
+
+    - name: Disable sending ICMP redirects (if not acting as a router)
+      ansible.builtin.sysctl:
+        name: "{{ item }}"
+        value: '0'
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/99-icmp-redirects.conf
+      loop:
+        - net.ipv4.conf.all.send_redirects
+        - net.ipv4.conf.default.send_redirects

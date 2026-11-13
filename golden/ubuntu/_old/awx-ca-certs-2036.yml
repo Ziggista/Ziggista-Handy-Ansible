@@ -1,0 +1,73 @@
+
+---
+- name: Configure MicroK8s trust for Gitea registry
+  hosts: P-GRAFANA-01
+  become: true
+
+  vars:
+    ca_cert_src: /home/dixk/ansible-lab/CertSrv-2036-4096.crt
+    ca_cert_dest: /var/snap/microk8s/current/certs/rrc-root-ca.crt
+    ca_cert_src_old: /home/dixk/ansible-lab/CertSrv-2036.crt
+    ca_cert_dest_old: /var/snap/microk8s/current/certs/rrc-root-ca.old.crt
+
+    registry_host: git.rrc.local
+    registry_config_dir: "/var/snap/microk8s/current/args/certs.d/git.rrc.local"
+
+  tasks:
+
+    - name: Copy CA certificate to MicroK8s cert store
+      copy:
+        src: "{{ ca_cert_src }}"
+        dest: "{{ ca_cert_dest }}"
+        mode: "0644"
+
+    - name: Install CA into system trust store
+      copy:
+        src: "{{ ca_cert_src }}"
+        dest: /usr/local/share/ca-certificates/rrc-root-ca.crt
+        mode: "0644"
+
+    - name: Update system CA trust
+      command: update-ca-certificates
+      changed_when: true
+
+    - name: Create containerd registry config directory
+      file:
+        path: "{{ registry_config_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Configure MicroK8s registry trust
+      copy:
+        dest: "{{ registry_config_dir }}/hosts.toml"
+        mode: "0644"
+        content: |
+          server = "https://{{ registry_host }}"
+
+          [host."https://{{ registry_host }}"]
+            capabilities = ["pull", "resolve"]
+
+            ca = "{{ ca_cert_dest }}"
+
+    - name: Restart MicroK8s
+      command: microk8s stop
+      changed_when: true
+
+    - name: Start MicroK8s
+      command: microk8s start
+      changed_when: true
+
+    - name: Wait for MicroK8s to become ready
+      command: microk8s status --wait-ready
+      changed_when: false
+
+    - name: Test image pull
+      command: >
+        microk8s ctr images pull
+        git.rrc.local/ti-team/cisco-ee:centos-stream10-ansible-core-2.20
+      register: image_pull_test
+      changed_when: false
+
+    - name: Show image pull result
+      debug:
+        var: image_pull_test.stdout_lines

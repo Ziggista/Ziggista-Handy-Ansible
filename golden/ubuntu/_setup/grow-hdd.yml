@@ -1,0 +1,46 @@
+
+---
+- name: Resize LVM after vSphere disk expansion
+  hosts: ansible_managed_ubuntu
+  become: yes
+
+  vars:
+    device: /dev/sda
+    partition_number: 3
+    partition: /dev/sda{{ partition_number }}
+    vg_name: ubuntu-vg
+    lv_name: ubuntu-lv
+
+  tasks:
+
+    - name: Ensure required packages are present
+      apt:
+        name: cloud-guest-utils
+        state: present
+        update_cache: yes
+
+    - name: Rescan disk
+      command: partprobe
+      changed_when: false
+
+    - name: Expand partition to fill disk
+      command: growpart {{ device }} {{ partition_number }}
+      register: growpart_out
+      changed_when: "'CHANGED' in growpart_out.stdout"
+      failed_when: >
+        growpart_out.rc != 0 and
+        'NOCHANGE' not in growpart_out.stdout
+
+
+    - name: Resize Physical Volume
+      community.general.lvg:
+        vg: "{{ vg_name }}"
+        pvs: "{{ partition }}"
+        pvresize: yes
+
+    - name: Extend Logical Volume to use all free space
+      community.general.lvol:
+        vg: "{{ vg_name }}"
+        lv: "{{ lv_name }}"
+        size: +100%FREE
+        resizefs: yes

@@ -1,0 +1,32 @@
+
+---
+- name: Deploy signed certificates
+  hosts:
+    # - elasticsearch
+    # - logstash
+    # - kibana
+    - oxidized
+  become: true
+
+  vars:
+    cert_dir: /etc/cert/2026
+
+  tasks:
+
+    - name: Copy signed certificate
+      copy:
+        src: "/home/dixk/ansible-lab/csrs/{{ inventory_hostname }}.cer"
+        dest: "{{ server_cert }}"
+        owner: root
+        group: root
+        mode: '0644'
+
+
+    - name: Verify certificate exists
+      stat:
+        path: "{{ server_cert }}"
+      register: cert
+
+    - name: Show certificate path
+      debug:
+        msg: "{{ cert.stat.path }}"

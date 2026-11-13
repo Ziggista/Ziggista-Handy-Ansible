@@ -1,0 +1,7 @@
+---
+- name: Bootstrap ansible user
+  hosts: ansible_managed_ubuntu
+  become: yes
+
+  roles:
+    - bootstrap_user

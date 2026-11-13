@@ -1,0 +1,102 @@
+
+---
+- name: Install correct guest tools based on hypervisor
+  hosts: ansible_managed_ubuntu
+  become: true
+
+
+  vars:
+    vmware_string: "VMware"
+
+  tasks:
+    # -------------------------
+    # Detection
+    # -------------------------
+    - name: Detect virtualization (systemd)
+      command: systemd-detect-virt
+      register: virt_type
+      changed_when: false
+
+    - name: Detect system product (DMI)
+      command: dmidecode -s system-product-name
+      register: dmi_product
+      changed_when: false
+      failed_when: false
+
+    - name: Detect system vendor (DMI)
+      command: dmidecode -s system-manufacturer
+      register: dmi_vendor
+      changed_when: false
+      failed_when: false
+
+    - name: Determine if VMware
+      set_fact:
+        is_vmware: >-
+          {{
+            (vmware_string in dmi_product.stdout) or
+            (vmware_string in dmi_vendor.stdout)
+          }}
+
+    - name: Show detection results
+      debug:
+        msg:
+          - "systemd detect: {{ virt_type.stdout }}"
+          - "product: {{ dmi_product.stdout }}"
+          - "vendor: {{ dmi_vendor.stdout }}"
+          - "is_vmware: {{ is_vmware }}"
+
+    # -------------------------
+    # VMware path
+    # -------------------------
+    - name: Install VMware tools
+      apt:
+        name: open-vm-tools
+        state: present
+        update_cache: yes
+      when: is_vmware
+
+    - name: Enable VMware tools
+      systemd:
+        name: open-vm-tools
+        state: started
+        enabled: yes
+      when: is_vmware
+
+    - name: Remove KVM guest agent on VMware
+      apt:
+        name: qemu-guest-agent
+        state: absent
+        purge: yes
+      when: is_vmware
+
+    # -------------------------
+    # KVM / Proxmox path
+    # -------------------------
+    - name: Install qemu guest agent
+      apt:
+        name: qemu-guest-agent
+        state: present
+        update_cache: yes
+      when: not is_vmware
+
+    - name: Enable qemu guest agent
+      systemd:
+        name: qemu-guest-agent
+        state: started
+        enabled: yes
+      when: not is_vmware
+
+    - name: Stop VMware tools if present
+      systemd:
+        name: open-vm-tools
+        state: stopped
+      ignore_errors: yes
+      when: not is_vmware
+
+    - name: Remove VMware tools on KVM
+      apt:
+        name: open-vm-tools
+        state: absent
+        purge: yes
+      when: not is_vmware
+

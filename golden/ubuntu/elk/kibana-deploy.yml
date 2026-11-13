@@ -1,0 +1,105 @@
+---
+- name: Deploy Kibana
+  hosts: P-KIBANA-01
+  become: true
+
+  vars:
+    elastic_version: "8.x"
+
+    es_hosts:
+      - "http://P-ES-01:9200"
+      - "http://P-ES-02:9200"
+      - "http://P-ES-03:9200"
+
+  tasks:
+
+    # -----------------------------
+    # INSTALL
+    # -----------------------------
+    - name: Install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Add Elastic GPG key
+      apt_key:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        state: present
+
+    - name: Add Elastic repository
+      apt_repository:
+        repo: "deb https://artifacts.elastic.co/packages/{{ elastic_version }}/apt stable main"
+        filename: elastic
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Kibana
+      apt:
+        name: kibana
+        state: present
+
+    # -----------------------------
+    # CONFIGURE KIBANA
+    # -----------------------------
+    - name: Configure kibana.yml
+      copy:
+        dest: /etc/kibana/kibana.yml
+        content: |
+          server.port: 5601
+          server.host: "0.0.0.0"
+
+          server.name: "{{ inventory_hostname }}"
+
+          elasticsearch.hosts:
+          {% for host in es_hosts %}
+            - "{{ host }}"
+          {% endfor %}
+
+          monitoring.ui.container.elasticsearch.enabled: true
+
+          logging:
+            appenders:
+              file:
+                type: file
+                fileName: /var/log/kibana/kibana.log
+                layout:
+                  type: json
+
+            root:
+              appenders:
+                - file
+              level: info
+      notify: restart kibana
+
+    - name: Ensure Kibana log directory exists
+      file:
+        path: /var/log/kibana
+        state: directory
+        owner: kibana
+        group: kibana
+        mode: '0755'
+
+    # -----------------------------
+    # ENABLE + START
+    # -----------------------------
+    - name: Enable Kibana
+      service:
+        name: kibana
+        enabled: true
+
+    - name: Start Kibana
+      service:
+        name: kibana
+        state: started
+
+  handlers:
+    - name: restart kibana
+      service:
+        name: kibana
+        state: restarted

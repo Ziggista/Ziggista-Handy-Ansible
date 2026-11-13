@@ -1,0 +1,11 @@
+---
+- name: Manage packages on Zabbix server
+  hosts: zabbix
+  become: yes
+
+  tasks:
+    - name: Ensure htop is installed
+      ansible.builtin.apt:
+        name: htop
+        state: present
+        update_cache: yes

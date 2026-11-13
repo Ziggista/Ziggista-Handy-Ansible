@@ -1,0 +1,102 @@
+---
+- name: Enable Gitea Container Registry
+  hosts: gitea
+  become: true
+
+  vars:
+    gitea_user: git
+    gitea_home: /var/lib/gitea
+    gitea_config_dir: /etc/gitea
+    gitea_http_port: 3000
+
+  tasks:
+
+  - name: Ensure packages directory exists (registry storage)
+    file:
+      path: "{{ gitea_home }}/data/packages"
+      state: directory
+      owner: "{{ gitea_user }}"
+      group: "{{ gitea_user }}"
+      mode: "0755"
+
+  # --------------------------------------------------------
+  # Inject registry config into app.ini (safe block insert)
+  # --------------------------------------------------------
+  - name: Enable Gitea container registry in app.ini
+    blockinfile:
+      path: "{{ gitea_config_dir }}/app.ini"
+      marker: "# {mark} ANSIBLE MANAGED BLOCK - REGISTRY"
+      block: |
+        [packages]
+        ENABLED = true
+
+        [packages.container]
+        ENABLED = true
+
+        [storage]
+        STORAGE_TYPE = local
+        PATH = {{ gitea_home }}/data/packages
+    notify: Restart Gitea
+
+  # --------------------------------------------------------
+  # Update NGINX for Docker push compatibility
+  # --------------------------------------------------------
+  - name: Fix nginx location block for Gitea
+    blockinfile:
+      path: /etc/nginx/sites-available/gitea
+      marker: "# {mark} ANSIBLE MANAGED BLOCK - GITEA LOCATION"
+      insertafter: "server_name"
+      block: |
+        location / {
+            proxy_pass http://127.0.0.1:{{ gitea_http_port }};
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            proxy_request_buffering off;
+            proxy_buffering off;
+        }
+    notify: Restart nginx
+
+  - name: Ensure larger upload size for images
+    replace:
+      path: /etc/nginx/sites-available/gitea
+      regexp: 'client_max_body_size .*;'
+      replace: 'client_max_body_size 2G;'
+    notify: Restart nginx
+
+  - name: Validate nginx config
+    command: nginx -t
+
+  - name: Flush handlers
+    meta: flush_handlers
+
+  - name: Show registry info
+    debug:
+      msg:
+        - "========================================"
+        - "Container Registry Enabled"
+        - ""
+        - "Registry endpoint:"
+        - "  https://{{ inventory_hostname }}/v2/"
+        - ""
+        - "Login:"
+        - "  docker login https://{{ inventory_hostname }}"
+        - ""
+        - "Example push:"
+        - "  docker tag nginx {{ inventory_hostname }}/<user>/<repo>:latest"
+        - "  docker push {{ inventory_hostname }}/<user>/<repo>:latest"
+        - "========================================"
+
+  handlers:
+
+  - name: Restart Gitea
+    service:
+      name: gitea
+      state: restarted
+
+  - name: Restart nginx
+    service:
+      name: nginx
+      state: restarted

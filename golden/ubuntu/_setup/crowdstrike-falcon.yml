@@ -1,0 +1,47 @@
+
+---
+- name: Install CrowdStrike Falcon Sensor
+  hosts: ansible_managed_ubuntu
+  become: yes
+
+  vars:
+    falcon_cid: "AD50219DFA2E4BABAB3A58A4770160E0-8E"
+    local_deb_path: "/home/dixk/ansible-lab/files/falcon-sensor_7.36.0-18909_amd64.deb"
+    remote_deb_path: "/tmp/falcon-sensor.deb"
+
+  tasks:
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Check if falcon sensor is running
+      ansible.builtin.set_fact:
+        falcon_running: >-
+          {{
+            'falcon-sensor.service' in ansible_facts.services and
+            ansible_facts.services['falcon-sensor.service'].state == 'running'
+          }}
+
+    - name: Copy Falcon sensor deb
+      ansible.builtin.copy:
+        src: "{{ local_deb_path }}"
+        dest: "{{ remote_deb_path }}"
+        mode: "0644"
+      when: not falcon_running
+
+    - name: Install Falcon sensor
+      ansible.builtin.apt:
+        deb: "{{ remote_deb_path }}"
+      when: not falcon_running
+
+    - name: Configure Falcon CID
+      ansible.builtin.command: >
+        /opt/CrowdStrike/falconctl -s --cid={{ falcon_cid }}
+      args:
+        creates: /opt/CrowdStrike/falconctl.cfg
+      when: not falcon_running
+
+    - name: Ensure falcon service is running
+      ansible.builtin.service:
+        name: falcon-sensor
+        state: started
+        enabled: yes

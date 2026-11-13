@@ -1,0 +1,92 @@
+---
+- name: Generate SSL private keys and CSRs for Radius
+  hosts:
+    - radius
+  become: true
+
+  tasks:
+
+    - name: Ensure certificate directory exists
+      file:
+        path: "{{ cert_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Create OpenSSL SAN configuration
+      copy:
+        dest: "{{ cert_dir }}/openssl-san.cnf"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          [ req ]
+          default_bits       = 4096
+          distinguished_name = req_distinguished_name
+          req_extensions     = v3_req
+          prompt             = no
+
+          [ req_distinguished_name ]
+          C            = AU
+          ST           = Queensland
+          L            = Rockhampton
+          O            = Rockhampton Regional Council
+          CN           = {{ inventory_hostname }}.rrc.local
+
+          [ v3_req ]
+          keyUsage = critical, digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth
+          subjectAltName = @alt_names
+
+          [ alt_names ]
+          DNS.1   = {{ inventory_hostname }}.rrc.local
+          DNS.2   = {{ inventory_hostname }}
+          DNS.3   = radius.rrc.local
+          IP.1    = {{ ansible_facts.default_ipv4.address }}
+
+    - name: Generate private key
+      command:
+        cmd: >
+          openssl genrsa
+          -out {{ server_key }}
+          4096
+      args:
+        creates: "{{ server_key }}"
+
+    - name: Restrict private key permissions
+      file:
+        path: "{{ server_key }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Generate CSR
+      command:
+        cmd: >
+          openssl req
+          -new
+          -key {{ server_key }}
+          -out {{ cert_dir }}/{{ inventory_hostname }}.csr
+          -config {{ cert_dir }}/openssl-san.cnf
+      args:
+        creates: "{{ cert_dir }}/{{ inventory_hostname }}.csr"
+
+    - name: Display CSR location
+      debug:
+        msg: "CSR created: {{ cert_dir }}/{{ inventory_hostname }}.csr"
+
+    - name: Create CSR collection directory
+      ansible.builtin.file:
+        path: /home/dixk/ansible-lab/csrs
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Fetch CSR to Ansible runner
+      ansible.builtin.fetch:
+        src: "{{ cert_dir }}/{{ inventory_hostname }}.csr"
+        dest: "/home/dixk/ansible-lab/csrs/{{ inventory_hostname }}.csr"
+        flat: true
