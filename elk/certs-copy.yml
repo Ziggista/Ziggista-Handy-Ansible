@@ -1,11 +1,13 @@
 
+# This play copies Certs post them been signed. Signed certs and the root CA go in elk/files/.
+
 ---
 - name: Deploy signed certificates
   hosts:
-    # - elasticsearch
-    # - logstash
-    # - kibana
-    - oxidized
+    - elasticsearch
+    - logstash
+    - kibana
+    # - oxidized
   become: true
 
   vars:
@@ -16,7 +18,7 @@
 
     - name: Copy signed certificate
       copy:
-        src: "/home/dixk/ansible-lab/csrs/{{ inventory_hostname }}.cer"
+        src: "files/{{ inventory_hostname }}.cer"
         dest: "{{ server_cert }}"
         owner: root
         group: root
@@ -31,3 +33,11 @@
     - name: Show certificate path
       debug:
         msg: "{{ cert.stat.path }}"
+
+    - name: Copy trusted Root CA 4096 key
+      copy:
+        src: files/CertSrv-2036-4096.cer
+        dest: "{{ cert_dir }}/CertSrv-2036-4096.cer"
+        owner: root
+        group: root
+        mode: '0644'

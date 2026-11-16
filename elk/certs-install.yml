@@ -1,5 +1,5 @@
 ---
-# Install the new RRC root CA (CertSrv-2036-4096.cer) and the newly signed
+# Install the new RRC root CA (files/CertSrv-2036-4096.cer) and the newly signed
 # host certs (files/<host>.cer) on the ELK stack, then restart each service
 # one host at a time.
 #
@@ -53,7 +53,7 @@
   vars:
     cert_dir: /etc/cert/2026
     staging_dir: "{{ cert_dir }}/staging"
-    new_ca_src: CertSrv-2036-4096.cer
+    new_ca_src: files/CertSrv-2036-4096.cer
     old_ca_file: /usr/local/share/ca-certificates/rrc-ca.crt
     new_ca_file: /usr/local/share/ca-certificates/rrc-ca-2036.crt
     ca_keep_old: true
@@ -198,6 +198,16 @@
       command: update-ca-certificates
       changed_when: true
       when: system_ca.changed
+
+    # es2-deploy / kibana-v2-deploy / logstash-deploy read the CA from here
+    - name: Install new root CA in cert directory
+      copy:
+        src: "{{ staging_dir }}/rrc-ca-2036.crt"
+        dest: "{{ cert_dir }}/CertSrv-2036-4096.cer"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
 
     - name: Install signed certificate in cert directory
       copy:

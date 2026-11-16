@@ -8,6 +8,8 @@
 
     cert_dir: "/etc/cert/2026"
     kibana_cert_dir: "/etc/kibana/certs"
+    # New root CA, put in cert_dir by certs-copy.yml / certs-install.yml
+    ca_src: "{{ cert_dir }}/CertSrv-2036-4096.cer"
 
     es_hosts:
       - "https://P-ES-01:9200"
@@ -80,7 +82,7 @@
 
     - name: Copy trusted CA
       copy:
-        src: /usr/local/share/ca-certificates/rrc-ca.crt
+        src: "{{ ca_src }}"
         dest: "{{ kibana_cert_dir }}/rrc-ca.crt"
         remote_src: true
         owner: root

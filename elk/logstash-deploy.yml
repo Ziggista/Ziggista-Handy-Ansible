@@ -9,7 +9,8 @@
     logstash_es_password: "jy1SpZcKVr39zF7Ytqt3cxsu71C5YUpH4brmxF9c1J7Lz"
 
     cert_dir: /etc/cert/2026
-    ca_file: /usr/local/share/ca-certificates/rrc-ca.crt
+    # New root CA, put in cert_dir by certs-copy.yml / certs-install.yml
+    ca_file: "{{ cert_dir }}/CertSrv-2036-4096.cer"
     logstash_cert_dir: /etc/logstash/certs
 
     logstash_port: 5044
