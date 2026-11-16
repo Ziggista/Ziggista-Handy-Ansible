@@ -1,0 +1,14 @@
+---
+- name: Install new TLS certificates for ELK
+  hosts:
+    - elasticsearch
+    - logstash
+    - kibana
+  become: true
+
+  vars:
+    cert_dir: /etc/cert/2026
+
+  tasks:
+
+    # TODO: add cert install tasks here
