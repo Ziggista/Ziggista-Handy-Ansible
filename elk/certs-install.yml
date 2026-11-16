@@ -1,0 +1,563 @@
+---
+# Install the new RRC root CA (CertSrv-2036-4096.cer) and the newly signed
+# host certs (files/<host>.cer) on the ELK stack, then restart each service
+# one host at a time.
+#
+# Assumes the private keys already exist at {{ cert_dir }}/<host>.key on each
+# host (created by certs-deploy.yml) and that the certs in files/ were signed
+# from those CSRs.
+#
+# Order of plays:
+#   1. Pre-flight (all hosts): stage CA + cert, check them, build CA bundle.
+#      Nothing is changed in the services if any host fails here.
+#   2. Logstash  (one at a time): new CA bundle, validate config, restart.
+#   3. Kibana    : new cert + CA bundle, restart Kibana, reload nginx.
+#   4. Elasticsearch CA bundle (all nodes, no restart): ES reloads PEM
+#      files on its own, so every node trusts old + new CA before any
+#      node presents a new cert.
+#   5. Elasticsearch certs (one node at a time): new cert, restart, wait.
+#
+# The CA bundle (rrc-ca.crt in each service cert dir) holds the new root
+# AND the old one, so clients still on the old CA keep working during the
+# change. Once everything is on the new certs, run again with
+#   -e ca_keep_old=false
+# to drop the old root from the bundles.
+#
+# Usage:
+#   ansible-playbook -i <inventory> elk/certs-install.yml
+#   ansible-playbook -i <inventory> elk/certs-install.yml --check --diff
+#
+# Staging files (CA, cert, bundle) are written to {{ cert_dir }}/staging even
+# in --check so the checks can run; nothing else changes in check mode.
+#
+# Optional extra vars:
+#   es_user / es_password  Elastic user able to read cluster health and set
+#                          cluster settings. If given, ES nodes are restarted
+#                          with shard allocation paused and the play waits for
+#                          green before moving on. Without them it waits for
+#                          the node's port and es_settle_seconds instead.
+#   force_restart=true     Restart services even if no files changed.
+#   ca_keep_old=false      Drop the old root from the CA bundles.
+
+# -----------------------------
+# 1. PRE-FLIGHT
+# -----------------------------
+- name: Pre-flight - stage and verify new certificates
+  hosts:
+    - elasticsearch
+    - logstash
+    - kibana
+  become: true
+  any_errors_fatal: true
+
+  vars:
+    cert_dir: /etc/cert/2026
+    staging_dir: "{{ cert_dir }}/staging"
+    new_ca_src: CertSrv-2036-4096.cer
+    old_ca_file: /usr/local/share/ca-certificates/rrc-ca.crt
+    new_ca_file: /usr/local/share/ca-certificates/rrc-ca-2036.crt
+    ca_keep_old: true
+
+  tasks:
+
+    - name: Check signed certificate exists in repo for this host
+      stat:
+        path: "{{ playbook_dir }}/files/{{ inventory_hostname }}.cer"
+      delegate_to: localhost
+      become: false
+      register: repo_cert
+
+    - name: Fail if no signed certificate for this host
+      assert:
+        that: repo_cert.stat.exists
+        fail_msg: "No files/{{ inventory_hostname }}.cer in the repo"
+
+    - name: Check private key exists on host
+      stat:
+        path: "{{ cert_dir }}/{{ inventory_hostname }}.key"
+      register: host_key
+
+    - name: Fail if private key is missing
+      assert:
+        that: host_key.stat.exists
+        fail_msg: "No {{ cert_dir }}/{{ inventory_hostname }}.key - run certs-deploy.yml first?"
+
+    - name: Ensure staging directory exists
+      file:
+        path: "{{ staging_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      check_mode: false
+
+    - name: Stage new root CA
+      copy:
+        src: "{{ new_ca_src }}"
+        dest: "{{ staging_dir }}/rrc-ca-2036.crt"
+        owner: root
+        group: root
+        mode: "0644"
+      check_mode: false
+
+    - name: Stage signed certificate
+      copy:
+        src: "files/{{ inventory_hostname }}.cer"
+        dest: "{{ staging_dir }}/{{ inventory_hostname }}.cer"
+        owner: root
+        group: root
+        mode: "0644"
+      check_mode: false
+
+    # Checks below are read-only, so run them in --check too
+    - name: Verify certificate chains to the new root CA
+      command: >
+        openssl verify -CAfile {{ staging_dir }}/rrc-ca-2036.crt
+        {{ staging_dir }}/{{ inventory_hostname }}.cer
+      changed_when: false
+      check_mode: false
+
+    - name: Verify certificate is not expired
+      command: >
+        openssl x509 -checkend 0 -noout
+        -in {{ staging_dir }}/{{ inventory_hostname }}.cer
+      changed_when: false
+      check_mode: false
+
+    - name: Verify certificate matches host name
+      command: >
+        openssl x509 -noout -checkhost {{ inventory_hostname }}.rrc.local
+        -in {{ staging_dir }}/{{ inventory_hostname }}.cer
+      register: checkhost
+      changed_when: false
+      failed_when: "'does match' not in checkhost.stdout"
+      check_mode: false
+
+    - name: Read certificate public key
+      command: >
+        openssl x509 -noout -pubkey
+        -in {{ staging_dir }}/{{ inventory_hostname }}.cer
+      register: cert_pubkey
+      changed_when: false
+      check_mode: false
+
+    - name: Read private key public key
+      command: >
+        openssl pkey -pubout
+        -in {{ cert_dir }}/{{ inventory_hostname }}.key
+      register: key_pubkey
+      changed_when: false
+      check_mode: false
+
+    - name: Fail if certificate does not match private key
+      assert:
+        that: cert_pubkey.stdout == key_pubkey.stdout
+        fail_msg: "files/{{ inventory_hostname }}.cer was not signed from {{ cert_dir }}/{{ inventory_hostname }}.key"
+
+    # CA bundle = new root + old root (unless ca_keep_old=false)
+    - name: Read new root CA
+      slurp:
+        src: "{{ staging_dir }}/rrc-ca-2036.crt"
+      register: new_ca_raw
+
+    - name: Read old root CA
+      slurp:
+        src: "{{ old_ca_file }}"
+      register: old_ca_raw
+      failed_when: false
+
+    - name: Build CA bundle content
+      set_fact:
+        new_ca_pem: "{{ new_ca_raw.content | b64decode | trim }}"
+        old_ca_pem: "{{ (old_ca_raw.content | default('') | b64decode | trim) }}"
+
+    - name: Write CA bundle
+      copy:
+        dest: "{{ staging_dir }}/rrc-ca-bundle.crt"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {{ new_ca_pem }}
+          {% if ca_keep_old | bool and old_ca_pem and new_ca_pem not in old_ca_pem %}
+          {{ old_ca_pem }}
+          {% endif %}
+      check_mode: false
+
+    - name: Install new root CA into system trust store
+      copy:
+        src: "{{ staging_dir }}/rrc-ca-2036.crt"
+        dest: "{{ new_ca_file }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      register: system_ca
+
+    - name: Update system CA trust
+      command: update-ca-certificates
+      changed_when: true
+      when: system_ca.changed
+
+    - name: Install signed certificate in cert directory
+      copy:
+        src: "{{ staging_dir }}/{{ inventory_hostname }}.cer"
+        dest: "{{ cert_dir }}/{{ inventory_hostname }}.cer"
+        remote_src: true
+        backup: true
+        owner: root
+        group: root
+        mode: "0644"
+
+
+# -----------------------------
+# 2. LOGSTASH
+# -----------------------------
+- name: Install new CA on Logstash
+  hosts: logstash
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  vars:
+    cert_dir: /etc/cert/2026
+    staging_dir: "{{ cert_dir }}/staging"
+    logstash_cert_dir: /etc/logstash/certs
+    logstash_port: 5044
+    force_restart: false
+
+  tasks:
+
+    - name: Install CA bundle for Logstash
+      copy:
+        src: "{{ staging_dir }}/rrc-ca-bundle.crt"
+        dest: "{{ logstash_cert_dir }}/rrc-ca.crt"
+        remote_src: true
+        backup: true
+        owner: root
+        group: logstash
+        mode: "0644"
+      register: ls_ca
+
+    - name: Validate Logstash config
+      command: /usr/share/logstash/bin/logstash --path.settings /etc/logstash -t
+      changed_when: false
+      when: ls_ca.changed or force_restart | bool
+
+    - name: Restart Logstash
+      service:
+        name: logstash
+        state: restarted
+      when: ls_ca.changed or force_restart | bool
+
+    - name: Wait for Logstash input port
+      wait_for:
+        port: "{{ logstash_port }}"
+        timeout: 300
+      when: ls_ca.changed or force_restart | bool
+
+    - name: Check Logstash is running
+      service_facts:
+
+    - name: Fail if Logstash is not running
+      assert:
+        that: ansible_facts.services['logstash.service'].state == 'running'
+        fail_msg: "Logstash is not running on {{ inventory_hostname }}"
+      when: not ansible_check_mode
+
+
+# -----------------------------
+# 3. KIBANA
+# -----------------------------
+- name: Install new certificate on Kibana
+  hosts: kibana
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  vars:
+    cert_dir: /etc/cert/2026
+    staging_dir: "{{ cert_dir }}/staging"
+    kibana_cert_dir: /etc/kibana/certs
+    nginx_ssl_dir: /etc/nginx/ssl
+    force_restart: false
+
+  tasks:
+
+    - name: Install Kibana certificate
+      copy:
+        src: "{{ staging_dir }}/{{ inventory_hostname }}.cer"
+        dest: "{{ kibana_cert_dir }}/{{ inventory_hostname }}.cer"
+        remote_src: true
+        backup: true
+        owner: root
+        group: kibana
+        mode: "0640"
+      register: kb_cert
+
+    - name: Install Kibana private key
+      copy:
+        src: "{{ cert_dir }}/{{ inventory_hostname }}.key"
+        dest: "{{ kibana_cert_dir }}/{{ inventory_hostname }}.key"
+        remote_src: true
+        owner: root
+        group: kibana
+        mode: "0640"
+      register: kb_key
+
+    - name: Install CA bundle for Kibana
+      copy:
+        src: "{{ staging_dir }}/rrc-ca-bundle.crt"
+        dest: "{{ kibana_cert_dir }}/rrc-ca.crt"
+        remote_src: true
+        backup: true
+        owner: root
+        group: kibana
+        mode: "0644"
+      register: kb_ca
+
+    - name: Restart Kibana
+      service:
+        name: kibana
+        state: restarted
+      when: kb_cert.changed or kb_key.changed or kb_ca.changed or force_restart | bool
+
+    - name: Wait for Kibana port
+      wait_for:
+        port: 5601
+        timeout: 300
+      when: kb_cert.changed or kb_key.changed or kb_ca.changed or force_restart | bool
+
+    - name: Check Kibana serves the new certificate
+      uri:
+        url: "https://{{ inventory_hostname }}.rrc.local:5601/api/status"
+        ca_path: "{{ staging_dir }}/rrc-ca-2036.crt"
+        validate_certs: true
+        status_code: [200, 401, 503]
+      register: kb_status
+      until: kb_status.status in [200, 401]
+      retries: 30
+      delay: 10
+      when: not ansible_check_mode
+
+    # nginx reverse proxy in front of Kibana (kibana-nginx.yml)
+    - name: Check nginx SSL directory exists
+      stat:
+        path: "{{ nginx_ssl_dir }}"
+      register: nginx_ssl
+
+    - name: Install nginx certificate
+      copy:
+        src: "{{ staging_dir }}/{{ inventory_hostname }}.cer"
+        dest: "{{ nginx_ssl_dir }}/kibana.crt"
+        remote_src: true
+        backup: true
+        owner: root
+        group: root
+        mode: "0644"
+      register: ngx_cert
+      when: nginx_ssl.stat.exists
+
+    - name: Install nginx private key
+      copy:
+        src: "{{ cert_dir }}/{{ inventory_hostname }}.key"
+        dest: "{{ nginx_ssl_dir }}/kibana.key"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      register: ngx_key
+      when: nginx_ssl.stat.exists
+
+    - name: Validate nginx configuration
+      command: nginx -t
+      changed_when: false
+      when: nginx_ssl.stat.exists and (ngx_cert.changed or ngx_key.changed or force_restart | bool)
+
+    - name: Reload nginx
+      service:
+        name: nginx
+        state: reloaded
+      when: nginx_ssl.stat.exists and (ngx_cert.changed or ngx_key.changed or force_restart | bool)
+
+    - name: Check nginx serves the new certificate
+      uri:
+        url: "https://{{ inventory_hostname }}.rrc.local/"
+        ca_path: "{{ staging_dir }}/rrc-ca-2036.crt"
+        validate_certs: true
+        follow_redirects: none
+        status_code: [200, 301, 302, 401]
+      when: nginx_ssl.stat.exists and not ansible_check_mode
+
+
+# -----------------------------
+# 4. ELASTICSEARCH - CA BUNDLE
+# -----------------------------
+- name: Install CA bundle on all Elasticsearch nodes
+  hosts: elasticsearch
+  become: true
+  any_errors_fatal: true
+
+  vars:
+    cert_dir: /etc/cert/2026
+    staging_dir: "{{ cert_dir }}/staging"
+    es_cert_dir: /etc/elasticsearch/certs
+    es_reload_wait: 30
+
+  tasks:
+
+    # ES watches its PEM files and reloads them (about every 5s), so all
+    # nodes trust old + new CA before any node swaps its own cert.
+    - name: Install CA bundle for Elasticsearch
+      copy:
+        src: "{{ staging_dir }}/rrc-ca-bundle.crt"
+        dest: "{{ es_cert_dir }}/rrc-ca.crt"
+        remote_src: true
+        backup: true
+        owner: root
+        group: elasticsearch
+        mode: "0644"
+      register: es_ca
+
+    - name: Wait for Elasticsearch to reload the CA bundle
+      pause:
+        seconds: "{{ es_reload_wait }}"
+      run_once: true
+      when: not ansible_check_mode
+
+
+# -----------------------------
+# 5. ELASTICSEARCH - NODE CERTS (rolling)
+# -----------------------------
+- name: Install new certificates on Elasticsearch (rolling)
+  hosts: elasticsearch
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  vars:
+    cert_dir: /etc/cert/2026
+    staging_dir: "{{ cert_dir }}/staging"
+    es_cert_dir: /etc/elasticsearch/certs
+    es_url: "https://{{ inventory_hostname }}:9200"
+    es_settle_seconds: 120
+    force_restart: false
+    es_auth: "{{ es_user is defined and es_password is defined }}"
+
+  tasks:
+
+    - name: Install node certificate
+      copy:
+        src: "{{ staging_dir }}/{{ inventory_hostname }}.cer"
+        dest: "{{ es_cert_dir }}/{{ inventory_hostname }}.cer"
+        remote_src: true
+        backup: true
+        owner: root
+        group: elasticsearch
+        mode: "0640"
+      register: es_cert
+
+    - name: Install node private key
+      copy:
+        src: "{{ cert_dir }}/{{ inventory_hostname }}.key"
+        dest: "{{ es_cert_dir }}/{{ inventory_hostname }}.key"
+        remote_src: true
+        owner: root
+        group: elasticsearch
+        mode: "0640"
+      register: es_key
+
+    - name: Decide whether to restart this node
+      set_fact:
+        es_restart: "{{ es_cert.changed or es_key.changed or force_restart | bool }}"
+
+    - name: Wait for cluster green before restarting
+      uri:
+        url: "{{ es_url }}/_cluster/health?wait_for_status=green&timeout=60s"
+        ca_path: "{{ staging_dir }}/rrc-ca-bundle.crt"
+        url_username: "{{ es_user }}"
+        url_password: "{{ es_password }}"
+        force_basic_auth: true
+      register: pre_health
+      until: pre_health.json.status | default('') == 'green'
+      retries: 30
+      delay: 10
+      when: es_restart and es_auth and not ansible_check_mode
+
+    - name: Pause shard allocation (primaries only)
+      uri:
+        url: "{{ es_url }}/_cluster/settings"
+        method: PUT
+        body_format: json
+        body: { "persistent": { "cluster.routing.allocation.enable": "primaries" } }
+        ca_path: "{{ staging_dir }}/rrc-ca-bundle.crt"
+        url_username: "{{ es_user }}"
+        url_password: "{{ es_password }}"
+        force_basic_auth: true
+      when: es_restart and es_auth and not ansible_check_mode
+
+    - name: Flush indices
+      uri:
+        url: "{{ es_url }}/_flush"
+        method: POST
+        ca_path: "{{ staging_dir }}/rrc-ca-bundle.crt"
+        url_username: "{{ es_user }}"
+        url_password: "{{ es_password }}"
+        force_basic_auth: true
+      failed_when: false
+      when: es_restart and es_auth and not ansible_check_mode
+
+    - name: Restart Elasticsearch
+      service:
+        name: elasticsearch
+        state: restarted
+      when: es_restart
+
+    - name: Wait for Elasticsearch HTTP port
+      wait_for:
+        host: "{{ ansible_default_ipv4.address }}"
+        port: 9200
+        timeout: 600
+      when: es_restart
+
+    - name: Check node serves the new certificate
+      uri:
+        url: "{{ es_url }}/"
+        ca_path: "{{ staging_dir }}/rrc-ca-2036.crt"
+        validate_certs: true
+        status_code: [200, 401]
+      register: es_tls
+      until: es_tls.status in [200, 401]
+      retries: 30
+      delay: 10
+      when: not ansible_check_mode
+
+    - name: Re-enable shard allocation
+      uri:
+        url: "{{ es_url }}/_cluster/settings"
+        method: PUT
+        body_format: json
+        body: { "persistent": { "cluster.routing.allocation.enable": null } }
+        ca_path: "{{ staging_dir }}/rrc-ca-bundle.crt"
+        url_username: "{{ es_user }}"
+        url_password: "{{ es_password }}"
+        force_basic_auth: true
+      when: es_restart and es_auth and not ansible_check_mode
+
+    - name: Wait for cluster green after restart
+      uri:
+        url: "{{ es_url }}/_cluster/health?wait_for_status=green&timeout=60s"
+        ca_path: "{{ staging_dir }}/rrc-ca-bundle.crt"
+        url_username: "{{ es_user }}"
+        url_password: "{{ es_password }}"
+        force_basic_auth: true
+      register: post_health
+      until: post_health.json.status | default('') == 'green'
+      retries: 60
+      delay: 10
+      when: es_restart and es_auth and not ansible_check_mode
+
+    - name: Wait for node to settle (no ES credentials given)
+      pause:
+        seconds: "{{ es_settle_seconds }}"
+      when: es_restart and not es_auth and not ansible_check_mode
