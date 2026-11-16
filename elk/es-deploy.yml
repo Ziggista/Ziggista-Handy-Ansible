@@ -1,0 +1,134 @@
+- name: Deploy Elasticsearch Cluster
+  hosts: elasticsearch
+  become: true
+
+  vars:
+    elastic_version: "8.x"
+    cluster_name: "elk-cluster"
+
+    es_nodes:
+      - P-ES-01
+      - P-ES-02
+      - P-ES-03
+
+  tasks:
+
+    # -----------------------------
+    # Install prerequisites
+    # -----------------------------
+    - name: Install prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Add Elastic GPG key
+      apt_key:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        state: present
+
+    - name: Add Elastic repository
+      apt_repository:
+        repo: "deb https://artifacts.elastic.co/packages/{{ elastic_version }}/apt stable main"
+        filename: elastic
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    # -----------------------------
+    # Install Elasticsearch
+    # -----------------------------
+    - name: Install Elasticsearch
+      apt:
+        name: elasticsearch
+        state: present
+
+    
+    - name: Ensure Elasticsearch directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: '0755'
+      loop:
+        - /var/lib/elasticsearch
+        - /var/log/elasticsearch
+  
+    - name: Remove Elasticsearch keystore (reset security config)
+      file:
+        path: /etc/elasticsearch/elasticsearch.keystore
+        state: absent
+      notify: restart elasticsearch
+
+    
+    - name: Fix ownership of /etc/elasticsearch
+      file:
+        path: /etc/elasticsearch
+        owner: elasticsearch
+        group: elasticsearch
+        recurse: yes
+
+
+    - name: Remove loopback hostname mapping (breaks ES clustering)
+      lineinfile:
+        path: /etc/cloud/templates/hosts.debian.tmpl
+        regexp: '^127\.0\.1\.1'
+        state: absent
+
+    - name: Regenerate /etc/hosts from template
+      command: cloud-init single --name update_etc_hosts
+
+    # -----------------------------
+    # Configure Elasticsearch
+    # -----------------------------
+    - name: Configure elasticsearch.yml
+      copy:
+        dest: /etc/elasticsearch/elasticsearch.yml
+        content: |
+          cluster.name: {{ cluster_name }}
+          node.name: {{ inventory_hostname }}
+
+          network.host: "{{ ansible_default_ipv4.address }}"
+          http.port: 9200
+
+          path.data: /var/lib/elasticsearch
+          path.logs: /var/log/elasticsearch
+
+          discovery.seed_hosts:
+          {% for host in es_nodes %}
+            - "{{ host }}"
+          {% endfor %}
+
+          cluster.initial_master_nodes:
+          {% for host in es_nodes %}
+            - "{{ host }}"
+          {% endfor %}
+
+          node.roles: [ master, data, ingest ]
+
+          xpack.security.enabled: false
+      notify: restart elasticsearch
+
+    # -----------------------------
+    # Enable + Start Service
+    # -----------------------------
+    - name: Enable Elasticsearch
+      service:
+        name: elasticsearch
+        enabled: true
+
+    - name: Start Elasticsearch
+      service:
+        name: elasticsearch
+        state: started
+
+  handlers:
+    - name: restart elasticsearch
+      service:
+        name: elasticsearch
+        state: restarted
