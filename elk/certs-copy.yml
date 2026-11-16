@@ -1,5 +1,5 @@
 
-# This play copies Certs post them been signed. See line 20 for storage post PKI issuance.
+# This play copies Certs post them been signed. Signed certs and the root CA go in elk/files/.
 
 ---
 - name: Deploy signed certificates
@@ -18,7 +18,7 @@
 
     - name: Copy signed certificate
       copy:
-        src: "/home/dixk/ansible-lab/playbooks/ubuntu/elk/files/{{ inventory_hostname }}.cer"
+        src: "files/{{ inventory_hostname }}.cer"
         dest: "{{ server_cert }}"
         owner: root
         group: root
@@ -36,7 +36,7 @@
 
     - name: Copy trusted Root CA 4096 key
       copy:
-        src: "/home/dixk/ansible-lab/playbooks/ubuntu/elk/files/CertSrv-2036-4096.cer"
+        src: files/CertSrv-2036-4096.cer
         dest: "{{ cert_dir }}/CertSrv-2036-4096.cer"
         owner: root
         group: root

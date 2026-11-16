@@ -10,7 +10,8 @@
     cert_dir: "/etc/cert/2026"
     es_cert_dir: "/etc/elasticsearch/certs"
 
-    # ca_cert: "/usr/local/share/ca-certificates/rrc-ca.crt"
+    # New root CA, put in cert_dir by certs-copy.yml / certs-install.yml
+    ca_src: "{{ cert_dir }}/CertSrv-2036-4096.cer"
     ca_cert: "{{ es_cert_dir }}/rrc-ca.crt"
 
     es_nodes:
@@ -97,7 +98,7 @@
 
     - name: Copy CA certificate
       copy:
-        src: /usr/local/share/ca-certificates/rrc-ca.crt
+        src: "{{ ca_src }}"
         dest: "{{ es_cert_dir }}/rrc-ca.crt"
         remote_src: true
         owner: root
